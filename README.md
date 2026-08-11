@@ -4,7 +4,31 @@
 
 不接 Cursor 桌面 GUI；每个会话都是 SDK 本地 Agent，跑在指定工作目录上。
 
-更新记录：[CHANGELOG.md](CHANGELOG.md)
+## 架构
+
+```mermaid
+flowchart LR
+  phone["Telegram 手机"]
+
+  subgraph mac ["Mac"]
+    bot["cursor-telegram-bridge<br/>Python · launchd"]
+    state["state/bots/.../<br/>sessions · events"]
+    web["Web 控制台 :9477"]
+    sdk["Cursor SDK bridge<br/>每文件夹一个进程"]
+    agent["本地 Agent<br/>cwd = 项目目录"]
+
+    bot --- state
+    bot --- web
+    bot <-->|"send / stream"| sdk
+    sdk --> agent
+  end
+
+  phone <-->|"Bot API 长轮询"| bot
+```
+
+- 仅响应 `ALLOWED_TELEGRAM_USER_ID`（可按 bot 配置群白名单）。
+- 每文件夹一个 Cursor bridge；会话记在 `state/bots/<name>/`，重启可 resume。
+- 用 `/use` 或会话列表选定当前会话后再发消息。
 
 ## 快速开始
 
@@ -30,16 +54,6 @@ launchctl load ~/Library/LaunchAgents/com.cursor-telegram-bridge.bot.plist
 ```
 
 日志：`state/cursor_bridge.err.log`。Stash/Clash **TUN + fake-ip** 下不要设 `HTTP(S)_PROXY`（会破坏长轮询）。
-
-## 工作原理
-
-```
-Telegram  <->  bridge（Mac）  <->  Cursor SDK  ->  各文件夹本地 Agent
-```
-
-- 仅响应 `ALLOWED_TELEGRAM_USER_ID`（可按 bot 配置群白名单）。
-- 每文件夹一个 Cursor bridge；会话记在 `state/bots/<name>/`，重启可 resume。
-- 用 `/use` 或会话列表选定当前会话后再发消息。
 
 ## 常用命令
 
