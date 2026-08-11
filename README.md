@@ -6,7 +6,7 @@
 
 ## 架构
 
-![Architecture](docs/architecture.svg)
+![Architecture](docs/architecture.png)
 
 - 仅响应 `ALLOWED_TELEGRAM_USER_ID`（可按 bot 配置群白名单）。
 - 每文件夹一个 Cursor bridge；会话记在 `state/bots/<name>/`，重启可 resume。
