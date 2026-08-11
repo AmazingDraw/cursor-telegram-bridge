@@ -7,15 +7,16 @@
 ## 架构
 
 ```mermaid
-flowchart LR
+flowchart TB
   phone["Telegram 手机"]
 
   subgraph mac ["Mac"]
+    direction TB
     bot["cursor-telegram-bridge<br/>Python · launchd"]
-    state["state/bots/.../<br/>sessions · events"]
+    state["state/bots/…/sessions · events"]
     web["Web 控制台 :9477"]
     sdk["Cursor SDK bridge<br/>每文件夹一个进程"]
-    agent["本地 Agent<br/>cwd = 项目目录"]
+    agent["本地 Agent · cwd = 项目目录"]
 
     bot --- state
     bot --- web
