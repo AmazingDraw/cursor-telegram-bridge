@@ -1,0 +1,54 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Keep cursor-telegram-bridge running and restart it on crash / login.
+
+  Edit every __PROJECT_DIR__ below to the absolute project path, then:
+    cp launchd/com.cursor-telegram-bridge.bot.plist ~/Library/LaunchAgents/
+    # or: sed "s|__PROJECT_DIR__|$PWD|g" launchd/... > ~/Library/LaunchAgents/...
+    launchctl load ~/Library/LaunchAgents/com.cursor-telegram-bridge.bot.plist
+  Stop / reload:
+    launchctl unload ~/Library/LaunchAgents/com.cursor-telegram-bridge.bot.plist
+    launchctl load   ~/Library/LaunchAgents/com.cursor-telegram-bridge.bot.plist
+
+  Do NOT set HTTP(S)_PROXY here when using Stash/Clash TUN + fake-ip.
+  TUN already routes the process; forcing :7890 HTTP proxy breaks Telegram
+  long-polling. Only set HTTPS_PROXY in .env for pure HTTP-proxy mode (no TUN).
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.cursor-telegram-bridge.bot</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>__PROJECT_DIR__/.venv/bin/python</string>
+        <string>-m</string>
+        <string>cursor_bridge</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>__PROJECT_DIR__</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    </dict>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>KeepAlive</key>
+    <true/>
+
+    <key>ThrottleInterval</key>
+    <integer>5</integer>
+
+    <key>StandardOutPath</key>
+    <string>__PROJECT_DIR__/state/cursor_bridge.out.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>__PROJECT_DIR__/state/cursor_bridge.err.log</string>
+</dict>
+</plist>

@@ -1,0 +1,22 @@
+.env
+.venv/
+venv/
+state/
+.cursor_bridge/
+__pycache__/
+*.py[cod]
+.DS_Store
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+build/
+dist/
+*.egg-info/
+LAUNCH-PLAN.md
+PLAN-live-files.md
+.claude/
+*.installed.plist
+
+# Personal bridge rules (may contain private personas)
+rules.md

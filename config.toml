@@ -1,0 +1,101 @@
+# cursor_bridge configuration (non-secret settings).
+# Secrets live in .env, not here.
+
+# Root folder scanned for projects when you run /new.
+projects_root = "~/Projects"
+
+# Default Cursor model for new sessions.
+model = "gpt-5.6-luna"
+
+# Default reasoning/effort level for new sessions (optional, e.g. "low", "medium", "high")
+effort = "low"
+
+# Models shown in the /model picker inline keyboard.
+models = [
+    "gpt-5.6-luna",
+    "grok-4.5",
+    "composer-2.5",
+    "kimi-k3",
+]
+
+# Max directory entries shown per screen in the /browse navigator.
+browser_page_size = 20
+
+# Per-session event log (state/events/{sid}.jsonl); oldest lines trimmed beyond this.
+event_log_max = 500
+
+# Local web console (http://127.0.0.1:9477) — session list, events, live log tail.
+console_enabled = true
+console_host = "127.0.0.1"
+console_port = 9477
+
+# When a session is already running and you send another message:
+#   queue (default) — finish the current run, then run queued prompts in order
+#                     (Telegram ack: 排队 / 发送 / 取消新命令)
+busy_policy = "queue"
+
+# Abort a hung agent run when there is no tool/text progress for N seconds.
+# On the first stall, auto-send「继续」once (same agent); second stall still aborts.
+run_stall_timeout_sec = 180
+
+# Max auto-continue retries when a run stalls (no progress for run_stall_timeout_sec).
+stall_auto_continue_max = 3
+
+# Prompt automatically sent on watchdog stall.
+stall_auto_continue_prompt = "继续"
+
+# Health probe: soft-restart (then launchd kickstart) when Telegram polling wedges.
+health_check_interval_sec = 60
+health_poll_fail_threshold = 8
+health_quiet_sec = 180
+# Per-bot getMe heartbeat: success resets the liveness clock (10s minimum).
+health_heartbeat_interval_sec = 30
+health_kickstart_after_soft = 2
+
+# Cursor ambient settings loaded into local agents (create + resume).
+# Loads on-disk configs under `.cursor/` (project) and `~/.cursor/` (user):
+# MCP, hooks, project `.cursor/rules`, etc.
+# Does NOT load Customize → Rules (User Rules) — those are cloud/IDE-only.
+# Use rules_file / rules below to inject those into Telegram prompts.
+setting_sources = ["user", "project"]
+
+# Bridge-owned rules injected into every prompt (new + resume).
+# Paste your Cursor User Rule text into rules.md (or set an absolute path).
+rules_file = "rules.md"
+# Optional inline alternative (or addition) to rules_file:
+# rules = """..."""
+
+# After a mid-stream bridge crash, try resuming the same agent on the fresh
+# bridge to keep conversation context. If resume reliably errors in your SDK
+# version, set to false to always recreate the agent.
+try_resume_first = true
+
+# Optional named bookmarks pinned to the top of /new.
+# [[bookmarks]]
+# name = "cursor-telegram-bridge"
+# path = "~/Projects/cursor-telegram-bridge"
+
+# Multi-bot: each entry polls its own Telegram bot. Tokens live in .env via token_env.
+# Session state is peer-aligned under state/bots/<name>/ (sessions.json + events/).
+# Process logs / pid stay in state/.
+#
+# Per-bot permission & group access (optional):
+#   permission = "full" | "readonly"
+#     full     — default; same as today (self-management shell still blocked)
+#     readonly — hard-deny Shell/Write/Edit/Delete/GenerateImage/MCP; Read/Grep/Glob
+#                only; every path arg must stay inside the session cwd
+#   allowed_chat_ids = [-100xxxxxxxxxx]
+#     Whitelist Telegram group/supergroup ids. Anyone in those chats can talk.
+#     Private chats still require allowed_user_id. /reload and /restart stay owner-only.
+[[bots]]
+name = "default"
+token_env = "TELEGRAM_BOT_TOKEN_1"
+permission = "full"
+
+[[bots]]
+name = "secondary"
+token_env = "TELEGRAM_BOT_TOKEN_2"
+permission = "full"
+# Example group-reader bot (uncomment & set real chat id):
+# permission = "readonly"
+# allowed_chat_ids = [-1001234567890]

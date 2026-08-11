@@ -1,0 +1,10 @@
+# Bridge global rules (injected into every Telegram prompt).
+#
+# Cursor Customize → User Rules are NOT visible to the SDK.
+# Copy this file to rules.md, paste your User Rule text, then /reload.
+#
+# Example:
+# # Agent 记忆与人设
+# ## 核心人设 (Persona: 小白)
+# - **定位**: …
+#

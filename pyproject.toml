@@ -1,0 +1,41 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cursor-telegram-bridge"
+dynamic = ["version"]
+description = "Control headless Cursor agent sessions from Telegram."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { file = "LICENSE" }
+authors = [{ name = "cursor-telegram-bridge contributors" }]
+keywords = ["cursor", "cursor-sdk", "telegram-bot", "macos", "ai-agents"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: MacOS X",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Software Development",
+]
+dependencies = [
+    "cursor-sdk>=0.1.6",
+    "python-telegram-bot[rate-limiter]>=21,<22",
+    "python-dotenv>=1.0",
+    "tomli>=2.0; python_version < '3.11'",
+]
+
+[project.scripts]
+cursor-telegram-bridge = "cursor_bridge.bot:main"
+
+[tool.setuptools.dynamic]
+version = { attr = "cursor_bridge.__version__" }
+
+[tool.setuptools.packages.find]
+include = ["cursor_bridge*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
