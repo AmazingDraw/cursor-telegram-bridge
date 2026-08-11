@@ -116,9 +116,9 @@ Telegram（手机）  <->  cursor-telegram-bridge（Mac）  <->  Cursor SDK brid
 
 ### Web 控制台
 
-bot 运行时在本机打开 **http://127.0.0.1:9477**：会话列表（支持多 bot）、每会话事件、日志尾部。
+bot 运行时在本机打开 [http://127.0.0.1:9477](http://127.0.0.1:9477)：会话列表（支持多 bot）、每会话事件、日志尾部。
 
-- 可在 `.env` 设 `CONSOLE_TOKEN`，访问 `http://127.0.0.1:9477?token=…`
+- 可在 `.env` 设 `CONSOLE_TOKEN`，访问 `http://127.0.0.1:9477?token=...`
 - `config.toml` 可改 `console_port`
 - `console_enabled = false` 可关闭
 - 终端面板：双击 `console.command`
