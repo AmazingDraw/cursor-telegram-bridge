@@ -69,8 +69,8 @@ class HealthProbe:
         self.state.last_ok_at = time.time()
         self.state.consecutive_poll_failures = 0
         self.state.updater_alive = True
-        # Sustained poll/owner health — allow soft restart before kickstart again.
-        self.state.soft_restarts = 0
+        # Do not clear soft_restarts here — owner messages call note_ok on every
+        # update and would prevent kickstart escalation after soft restarts.
 
     def note_poll_error(self, err: BaseException | None = None) -> None:
         self.state.last_poll_error_at = time.time()
@@ -171,6 +171,22 @@ class HealthProbe:
             and quiet >= self.quiet_sec
         )
         if not wedged:
+            # Sustained health after the last recovery — reset escalation counter.
+            # Require updater alive, no poll failures, and past recovery cooldown
+            # so a soft-restart notify + owner reply cannot wipe the counter.
+            healthy_for = now - self.state.last_recovery_at
+            if (
+                self.state.soft_restarts
+                and not updater_dead
+                and failures == 0
+                and self.state.last_recovery_at > 0
+                and healthy_for >= max(300.0, self.quiet_sec)
+            ):
+                logger.info(
+                    "Health probe: sustained healthy for %.0fs — resetting soft_restarts",
+                    healthy_for,
+                )
+                self.state.soft_restarts = 0
             return
 
         reason = (

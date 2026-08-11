@@ -154,14 +154,11 @@ async def download_telegram_file(
         )
     tg_file = await context.bot.get_file(file_id)
     size = tg_file.file_size if tg_file.file_size else declared_size
-    if size is None:
-        raise ValueError(
-            "File size unknown; refusing download (missing file_size metadata)."
-        )
-    if size > MAX_INBOUND_BYTES:
+    if size is not None and size > MAX_INBOUND_BYTES:
         raise ValueError(
             f"File too large ({size // (1024 * 1024)}MB). Telegram limit is 20MB."
         )
+    # Unknown size: still download, then enforce the limit on the written file.
     dest.parent.mkdir(parents=True, exist_ok=True)
     await tg_file.download_to_drive(custom_path=str(dest))
     try:

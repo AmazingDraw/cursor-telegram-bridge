@@ -1263,13 +1263,8 @@ async def _drain_prompt_queue(context: ContextTypes.DEFAULT_TYPE, s: Session) ->
     mgr = _mgr(context)
     if mgr.is_busy(s):
         return
-    head = mgr.peek_queued_prompt(s.short_id)
-    if head is None:
-        return
-    if not head.confirmed:
-        # Still waiting on the 待确认 keyboard — do not auto-start.
-        return
-    item = mgr.pop_queued_prompt(s.short_id)
+    # Prefer the first confirmed item; unconfirmed heads (待确认) must not block it.
+    item = mgr.pop_first_confirmed_prompt(s.short_id)
     if item is None:
         return
     remaining = mgr.queued_count(s.short_id)

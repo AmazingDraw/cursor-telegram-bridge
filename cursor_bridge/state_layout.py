@@ -8,7 +8,6 @@ multi-bot setups stay peer-aligned.
 from __future__ import annotations
 
 import logging
-import re
 import shutil
 from pathlib import Path
 
@@ -16,18 +15,22 @@ from .config import BotConfig, Config
 
 logger = logging.getLogger(__name__)
 
-_SAFE_BOT_NAME = re.compile(r"[^a-zA-Z0-9._-]+")
-
 
 def sanitize_bot_name(name: str | None, *, fallback: str = "default") -> str:
-    """Collapse a bot name to a single path segment (no ``..`` / separators)."""
+    """Collapse a bot name to a single path segment (no ``..`` / separators).
+
+    Unicode and spaces are preserved so existing ``state/bots/<name>`` dirs keep
+    working; only path-escape characters are stripped.
+    """
     raw = (name or "").strip() or fallback
     # Drop any directory components an attacker might put in config.
-    raw = raw.replace("\\", "/").split("/")[-1]
-    cleaned = _SAFE_BOT_NAME.sub("_", raw).strip("._")
-    if not cleaned or cleaned in {".", ".."}:
+    raw = raw.replace("\\", "/").split("/")[-1].strip()
+    raw = raw.replace("\0", "")
+    if not raw or raw in {".", ".."} or ".." in raw:
         return fallback
-    return cleaned
+    if "/" in raw or "\\" in raw:
+        return fallback
+    return raw[:128]
 
 
 def bot_name_for(bot_cfg: BotConfig | None) -> str:

@@ -599,6 +599,26 @@ class SessionManager:
             self._prompt_queues.pop(sid, None)
         return item
 
+    def pop_first_confirmed_prompt(self, sid: str) -> QueuedPrompt | None:
+        """Remove and return the first confirmed item; leave unconfirmed heads in place."""
+        q = self._prompt_queues.get(sid)
+        if not q:
+            return None
+        kept: deque[QueuedPrompt] = deque()
+        found: QueuedPrompt | None = None
+        for item in q:
+            if found is None and item.confirmed:
+                found = item
+                continue
+            kept.append(item)
+        if found is None:
+            return None
+        if kept:
+            self._prompt_queues[sid] = kept
+        else:
+            self._prompt_queues.pop(sid, None)
+        return found
+
     def confirm_queued_by_token(self, sid: str, token: str) -> QueuedPrompt | None:
         """Mark a queued item confirmed so drain may run it. Returns the item or None."""
         item = self.find_queued_by_token(sid, token)
@@ -1091,7 +1111,10 @@ class SessionManager:
         logger.info("Session %s run %s started", s.short_id, s.run_id)
 
         # Keep streamed assistant text across stall auto-continue retries.
+        # On the first new assistant event after continue, replace (don't append)
+        # so live UI does not stack pre-stall text with the continuation.
         text_parts: list[str] = list(_carry_text_parts or [])
+        replace_text_on_next_assistant = bool(_carry_text_parts)
         tool_hits: list[tuple[str, object, object]] = []
         sent_paths: set[str] = set()
         running_tools: set[str] = set()
@@ -1234,6 +1257,9 @@ class SessionManager:
                 if message is not None:
                     mtype = getattr(message, "type", None)
                     if mtype == "assistant":
+                        if replace_text_on_next_assistant:
+                            text_parts.clear()
+                            replace_text_on_next_assistant = False
                         content = getattr(getattr(message, "message", None), "content", []) or []
                         for block in content:
                             if getattr(block, "type", None) == "text":
