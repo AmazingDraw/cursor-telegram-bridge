@@ -102,6 +102,38 @@ def test_live_message_flush_swallows_network_error() -> None:
     assert live._last == ""
 
 
+def test_live_message_update_force_does_not_await_network() -> None:
+    """update(force=True) must return immediately even if Telegram hangs.
+
+    Previously force awaited edit_message and blocked the SDK event consumer.
+    """
+    bot = MagicMock()
+    live = bot_mod.LiveMessage(bot, chat_id=1, message_id=2)
+    hang = asyncio.Event()
+
+    async def never_returns(*_a, **_k):
+        await hang.wait()
+
+    bot.edit_message_text = never_returns
+
+    async def run():
+        # Must complete quickly — must not wait on never_returns.
+        await asyncio.wait_for(live.update("hello", force=True), timeout=0.5)
+        assert live._pending == "hello"
+        assert live._flush_task is not None
+        live._flush_task.cancel()
+        try:
+            await live._flush_task
+        except asyncio.CancelledError:
+            pass
+
+    asyncio.run(run())
+
+
+def test_live_telegram_retries_is_one() -> None:
+    assert bot_mod._LIVE_TELEGRAM_NETWORK_RETRIES == 1
+
+
 def test_send_html_chunks_falls_back_when_edit_fails() -> None:
     bot = MagicMock()
 

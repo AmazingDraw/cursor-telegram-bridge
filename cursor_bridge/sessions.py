@@ -90,7 +90,9 @@ STALL_AUTO_CONTINUE_PROMPT = "继续"
 STALL_AUTO_CONTINUE_MAX = 1
 
 # Default stall watchdog (overridden by Config.run_stall_timeout_sec).
-DEFAULT_RUN_STALL_TIMEOUT_SEC = 180.0
+DEFAULT_RUN_STALL_TIMEOUT_SEC = 300.0
+# Longer allowance while a tool call is in flight (no new events).
+DEFAULT_RUN_TOOL_STALL_TIMEOUT_SEC = 600.0
 
 # Async callback the bot passes in to receive live transcript updates (force=True bypasses throttle).
 UpdateCb = Callable[..., Awaitable[None]]
@@ -1023,6 +1025,15 @@ class SessionManager:
             or DEFAULT_RUN_STALL_TIMEOUT_SEC
         )
         stall_timeout = max(30.0, stall_timeout)
+        tool_stall_timeout = float(
+            getattr(
+                self.cfg,
+                "run_tool_stall_timeout_sec",
+                DEFAULT_RUN_TOOL_STALL_TIMEOUT_SEC,
+            )
+            or DEFAULT_RUN_TOOL_STALL_TIMEOUT_SEC
+        )
+        tool_stall_timeout = max(stall_timeout, tool_stall_timeout)
         auto_continue_max = int(
             getattr(self.cfg, "stall_auto_continue_max", STALL_AUTO_CONTINUE_MAX)
             or STALL_AUTO_CONTINUE_MAX
@@ -1033,6 +1044,7 @@ class SessionManager:
         )
         last_progress = time.monotonic()
         stalled = False
+        stalled_limit = stall_timeout
 
         def _mark_progress() -> None:
             nonlocal last_progress
@@ -1047,8 +1059,9 @@ class SessionManager:
                         stop_heartbeat.wait(), timeout=LIVE_TIMER_INTERVAL_SEC,
                     )
                 except asyncio.TimeoutError:
-                    if running_tools:
-                        _mark_progress()
+                    # Do NOT mark progress here — a hung tool used to reset the
+                    # stall clock forever via running_tools. Only real SDK events
+                    # (assistant/tool/status/summary) count as progress.
                     elapsed = int(time.monotonic() - t0)
                     await on_update(
                         _build_live(s, text_parts, live, elapsed=elapsed),
@@ -1057,27 +1070,32 @@ class SessionManager:
 
         async def _stall_watchdog() -> None:
             """Cancel the SDK run if it stops producing events (noon hang class)."""
-            nonlocal stalled
+            nonlocal stalled, stalled_limit
             while not stop_heartbeat.is_set():
                 try:
                     await asyncio.wait_for(stop_heartbeat.wait(), timeout=15.0)
                     return
                 except asyncio.TimeoutError:
                     idle = time.monotonic() - last_progress
-                    if idle < stall_timeout:
+                    limit = tool_stall_timeout if running_tools else stall_timeout
+                    if idle < limit:
                         continue
                     stalled = True
+                    stalled_limit = limit
                     logger.error(
-                        "Session %s run stalled for %.0fs (timeout=%.0fs) — cancelling",
+                        "Session %s run stalled for %.0fs (timeout=%.0fs, "
+                        "tools_running=%s) — cancelling",
                         s.short_id,
                         idle,
-                        stall_timeout,
+                        limit,
+                        bool(running_tools),
                     )
                     self.event_log.append(
                         s.short_id,
                         "run_stall",
                         idle_sec=int(idle),
-                        timeout_sec=int(stall_timeout),
+                        timeout_sec=int(limit),
+                        tools_running=bool(running_tools),
                         run_id=s.run_id,
                     )
                     live["snippet"] = ""
@@ -1373,7 +1391,7 @@ class SessionManager:
                 self.event_log.append(
                     s.short_id,
                     "run_stall_auto_continue",
-                    timeout_sec=int(stall_timeout),
+                    timeout_sec=int(stalled_limit),
                     retry=_stall_retries + 1,
                     run_id=s.run_id,
                 )
@@ -1413,7 +1431,7 @@ class SessionManager:
                     _stall_retries=_stall_retries + 1,
                 )
             final = (
-                f"**Run aborted:** no agent progress for {int(stall_timeout)}s "
+                f"**Run aborted:** no agent progress for {int(stalled_limit)}s "
                 "(hung run watchdog).\n\n"
                 f"Already auto-retried {auto_continue_max} time(s) with「{auto_continue_prompt}」. "
                 "Send the prompt again, or `/reload` if this keeps happening."

@@ -35,8 +35,10 @@ console_port = 9477
 busy_policy = "queue"
 
 # Abort a hung agent run when there is no tool/text progress for N seconds.
-# On the first stall, auto-send「继续」once (same agent); second stall still aborts.
-run_stall_timeout_sec = 180
+# Thinking (no tools): run_stall_timeout_sec. Tool in-flight: run_tool_stall_timeout_sec.
+# On stall, auto-send「继续」up to stall_auto_continue_max times; then abort.
+run_stall_timeout_sec = 300
+run_tool_stall_timeout_sec = 600
 
 # Max auto-continue retries when a run stalls (no progress for run_stall_timeout_sec).
 stall_auto_continue_max = 3

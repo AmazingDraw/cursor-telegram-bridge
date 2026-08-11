@@ -579,8 +579,9 @@ _CHAT_ACTION_MIN_INTERVAL = 5.0
 # on flaky paths to api.telegram.org — retry with backoff instead of failing the run.
 _TELEGRAM_NETWORK_RETRIES = 3
 _TELEGRAM_NETWORK_BASE_DELAY = 0.8
-# Live edits use the same cap (keeps SDK stream from stalling on long backoff).
-_LIVE_TELEGRAM_NETWORK_RETRIES = _TELEGRAM_NETWORK_RETRIES
+# Live mid-run edits: fail fast. update() never awaits network — a long retry
+# cascade previously blocked the SDK event consumer and caused bridge disconnects.
+_LIVE_TELEGRAM_NETWORK_RETRIES = 1
 
 
 def _is_retryable_telegram_network(exc: BaseException) -> bool:
@@ -625,7 +626,12 @@ async def _await_telegram(
 
 
 class LiveMessage:
-    """Edits a single Telegram message in place, coalesced to avoid rate limits."""
+    """Edits a single Telegram message in place, coalesced to avoid rate limits.
+
+    ``update()`` never awaits Telegram I/O — it only schedules a background flush.
+    That keeps the Cursor SDK event consumer from stalling on flaky Telegram paths.
+    Call ``flush()`` after the run finishes to push any remaining pending text.
+    """
 
     def __init__(self, bot, chat_id: int, message_id: int) -> None:
         self.bot = bot
@@ -638,17 +644,24 @@ class LiveMessage:
         self._lock = asyncio.Lock()
 
     async def update(self, text: str, force: bool = False) -> None:
+        """Queue live text. Never blocks on Telegram (force only shortens delay)."""
         self._pending = text[:TG_LIMIT]
-        if force:
-            await self._flush()
-            return
         now = time.time()
         elapsed = now - self._last_edit
-        if elapsed >= _TELEGRAM_EDIT_MIN_INTERVAL:
-            await self._flush()
+        if force or elapsed >= _TELEGRAM_EDIT_MIN_INTERVAL:
+            delay = 0.0
+        else:
+            delay = max(0.1, _TELEGRAM_EDIT_MIN_INTERVAL - elapsed)
+        self._schedule_flush(delay)
+
+    def _schedule_flush(self, delay: float) -> None:
+        """Ensure a background flush runs; force/immediate replaces a pending delay."""
+        if delay <= 0.0:
+            if self._flush_task is not None and not self._flush_task.done():
+                self._flush_task.cancel()
+            self._flush_task = asyncio.create_task(self._flush_after(0.0))
             return
         if self._flush_task is None or self._flush_task.done():
-            delay = max(0.1, _TELEGRAM_EDIT_MIN_INTERVAL - elapsed)
             self._flush_task = asyncio.create_task(self._flush_after(delay))
 
     async def flush(self) -> None:
@@ -656,13 +669,16 @@ class LiveMessage:
         if self._flush_task is not None and not self._flush_task.done():
             try:
                 await self._flush_task
+            except asyncio.CancelledError:
+                pass
             except Exception:  # noqa: BLE001
                 logger.debug("live flush task failed", exc_info=True)
         if self._pending and self._pending != self._last:
             await self._flush()
 
     async def _flush_after(self, delay: float) -> None:
-        await asyncio.sleep(delay)
+        if delay > 0:
+            await asyncio.sleep(delay)
         await self._flush()
 
     async def _flush(self) -> None:
@@ -2005,10 +2021,14 @@ async def _execute_prompt(
             now = time.time()
             if now - last_chat_action >= _CHAT_ACTION_MIN_INTERVAL:
                 last_chat_action = now
-                try:
-                    await context.bot.send_chat_action(chat_id, ChatAction.TYPING)
-                except Exception:  # noqa: BLE001
-                    pass
+
+                async def _typing() -> None:
+                    try:
+                        await context.bot.send_chat_action(chat_id, ChatAction.TYPING)
+                    except Exception:  # noqa: BLE001
+                        pass
+
+                asyncio.create_task(_typing())
 
     async def on_attachment(path: Path) -> bool:
         return await _send_one_attachment(

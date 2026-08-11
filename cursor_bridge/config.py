@@ -70,7 +70,9 @@ class Config:
     rules_text: str = ""
     rules_file: Path | None = None
     # Abort a run when no assistant/tool progress for this many seconds.
-    run_stall_timeout_sec: float = 180.0
+    run_stall_timeout_sec: float = 300.0
+    # Longer allowance while a tool call is in flight but emits no new events.
+    run_tool_stall_timeout_sec: float = 600.0
     # Max auto-continue retries when a run stalls (no progress for run_stall_timeout_sec).
     stall_auto_continue_max: int = 3
     # Prompt automatically sent on watchdog stall.
@@ -143,8 +145,13 @@ def load_config(project_root: Path) -> Config:
     try_resume_first = bool(data.get("try_resume_first", True))
     rules_text, rules_file = _load_rules(data, project_root)
     run_stall_timeout_sec = _positive_float(
-        data.get("run_stall_timeout_sec"), default=180.0, minimum=30.0,
+        data.get("run_stall_timeout_sec"), default=300.0, minimum=30.0,
     )
+    run_tool_stall_timeout_sec = _positive_float(
+        data.get("run_tool_stall_timeout_sec"), default=600.0, minimum=30.0,
+    )
+    if run_tool_stall_timeout_sec < run_stall_timeout_sec:
+        run_tool_stall_timeout_sec = run_stall_timeout_sec
     stall_auto_continue_max = _positive_int(
         data.get("stall_auto_continue_max"), default=3, minimum=1,
     )
@@ -252,6 +259,7 @@ def load_config(project_root: Path) -> Config:
         rules_text=rules_text,
         rules_file=rules_file,
         run_stall_timeout_sec=run_stall_timeout_sec,
+        run_tool_stall_timeout_sec=run_tool_stall_timeout_sec,
         stall_auto_continue_max=stall_auto_continue_max,
         stall_auto_continue_prompt=stall_auto_continue_prompt,
         health_check_interval_sec=health_check_interval_sec,
