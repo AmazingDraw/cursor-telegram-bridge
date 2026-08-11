@@ -566,7 +566,7 @@ def _menu_kb() -> InlineKeyboardMarkup:
         ],
         [
             InlineKeyboardButton("\u267B\uFE0F 重启服务", callback_data="menu:restart"),
-            InlineKeyboardButton("\U0001F504 重新加载", callback_data="menu:reload"),
+            InlineKeyboardButton("⚛️ 重新加载", callback_data="menu:reload"),
         ],
     ])
 
@@ -2588,7 +2588,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             _log_action("Reload requested (menu)", user=update.effective_user.id, bot=bot_name)
             await context.bot.send_message(
                 chat_id,
-                "🛠️ <b>正在重载守护进程…</b>\n\n"
+                "⚛️ <b>正在重载守护进程…</b>\n\n"
                 "重新加载 Python 源代码与环境，恢复在线时会自动通知您。",
                 parse_mode=ParseMode.HTML,
             )
@@ -2724,7 +2724,7 @@ async def cmd_reload(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     _request_restart(cfg, update.effective_chat.id, mode="reload", bot=bot_name)
     _log_action("Reload requested (launchd kickstart)", user=update.effective_user.id, bot=bot_name)
     await update.message.reply_text(
-        "🛠️ <b>正在重载守护进程…</b>\n\n"
+        "⚛️ <b>正在重载守护进程…</b>\n\n"
         "重新加载 Python 源代码与环境，恢复在线时会自动通知您。",
         parse_mode=ParseMode.HTML,
     )
@@ -2830,7 +2830,7 @@ async def _post_init(app: Application) -> None:
             BotCommand("usage", "🔋 配额：查看额度与用量"),
             BotCommand("cancel", "⏸️ 停止：中断当前运行任务"),
             BotCommand("restart", "♻️ 重启：刷新服务与配置"),
-            BotCommand("reload", "🛠️ 重载：载入最新程序代码"),
+            BotCommand("reload", "⚛️ 重载：载入最新程序代码"),
         ]
         try:
             await app.bot.delete_my_commands(scope=BotCommandScopeDefault())

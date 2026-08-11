@@ -197,13 +197,13 @@ launchctl kickstart -k "gui/$(id -u)/com.cursor-telegram-bridge.bot"
 ## 远程重载（手机）
 
 1. 打开 Telegram bot
-2. 发 **`/reload`** 或点 **🔄 重新加载**
+2. 发 **`/reload`** 或点 **⚛️ 重新加载**
 3. 等待 bot 通知已恢复
 
 | 操作 | Telegram | 说明 |
 | --- | --- | --- |
 | 软重启 | `/restart` 或 **♻️ 重启** | 重载 `.env` / `config.toml`，不重载 Python |
-| 完整重启 | `/reload` 或 **🔄 重新加载** | launchd 完整重启，**加载代码变更** |
+| 完整重启 | `/reload` 或 **⚛️ 重新加载** | launchd 完整重启，**加载代码变更** |
 
 `/reload` 前建议等当前任务结束或 `/cancel`。
 
