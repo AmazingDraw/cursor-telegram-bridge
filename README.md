@@ -6,26 +6,7 @@
 
 ## 架构
 
-```mermaid
-flowchart TB
-  phone["Telegram 手机"]
-
-  subgraph mac ["Mac"]
-    direction TB
-    bot["cursor-telegram-bridge<br/>Python · launchd"]
-    state["state/bots/…/sessions · events"]
-    web["Web 控制台 :9477"]
-    sdk["Cursor SDK bridge<br/>每文件夹一个进程"]
-    agent["本地 Agent · cwd = 项目目录"]
-
-    bot --- state
-    bot --- web
-    bot <-->|"send / stream"| sdk
-    sdk --> agent
-  end
-
-  phone <-->|"Bot API 长轮询"| bot
-```
+![Architecture](docs/architecture.svg)
 
 - 仅响应 `ALLOWED_TELEGRAM_USER_ID`（可按 bot 配置群白名单）。
 - 每文件夹一个 Cursor bridge；会话记在 `state/bots/<name>/`，重启可 resume。
