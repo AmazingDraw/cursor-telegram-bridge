@@ -145,14 +145,53 @@ async def download_telegram_file(
     context: ContextTypes.DEFAULT_TYPE,
     file_id: str,
     dest: Path,
+    *,
+    declared_size: int | None = None,
 ) -> None:
-    tg_file = await context.bot.get_file(file_id)
-    if tg_file.file_size and tg_file.file_size > MAX_INBOUND_BYTES:
+    if declared_size is not None and declared_size > MAX_INBOUND_BYTES:
         raise ValueError(
-            f"File too large ({tg_file.file_size // (1024 * 1024)}MB). Telegram limit is 20MB."
+            f"File too large ({declared_size // (1024 * 1024)}MB). Telegram limit is 20MB."
+        )
+    tg_file = await context.bot.get_file(file_id)
+    size = tg_file.file_size if tg_file.file_size else declared_size
+    if size is None:
+        raise ValueError(
+            "File size unknown; refusing download (missing file_size metadata)."
+        )
+    if size > MAX_INBOUND_BYTES:
+        raise ValueError(
+            f"File too large ({size // (1024 * 1024)}MB). Telegram limit is 20MB."
         )
     dest.parent.mkdir(parents=True, exist_ok=True)
     await tg_file.download_to_drive(custom_path=str(dest))
+    try:
+        actual = dest.stat().st_size
+    except OSError:
+        actual = 0
+    if actual > MAX_INBOUND_BYTES:
+        try:
+            dest.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise ValueError(
+            f"Downloaded file too large ({actual // (1024 * 1024)}MB). Limit is 20MB."
+        )
+
+
+def _declared_file_size(message: Message) -> int | None:
+    """Best-effort size from the message payload (before getFile)."""
+    for attr in ("document", "animation", "video", "audio", "voice", "video_note"):
+        obj = getattr(message, attr, None)
+        if obj is None:
+            continue
+        size = getattr(obj, "file_size", None)
+        if size:
+            return int(size)
+    if message.photo:
+        size = getattr(message.photo[-1], "file_size", None)
+        if size:
+            return int(size)
+    return None
 
 
 def _pick_photo_file_id(message: Message) -> str | None:
@@ -217,7 +256,12 @@ async def save_inbound_attachment(
     file_id, filename, kind = spec
     stamp = int(time.time())
     dest = inbound_dir(cwd) / f"{stamp}_{filename}"
-    await download_telegram_file(context, file_id, dest)
+    await download_telegram_file(
+        context,
+        file_id,
+        dest,
+        declared_size=_declared_file_size(message),
+    )
     return PendingInbound(
         path=dest,
         kind=kind,

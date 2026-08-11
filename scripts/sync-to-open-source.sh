@@ -11,13 +11,21 @@ DEST_DIR="${HOME}/Projects/GitHub Copilot/${PROJECT_NAME}"
 echo "==> Syncing ${PROJECT_NAME} -> ${DEST_DIR}"
 mkdir -p "${DEST_DIR}"
 
-# 1. Copy tracked git files
+# 1. Copy tracked git files (exclude private-only / non-OSS paths)
 cd "${SRC_DIR}"
 git ls-files | while read -r file; do
+    case "${file}" in
+        tests|tests/*)
+            continue
+            ;;
+    esac
     dir="$(dirname "${DEST_DIR}/${file}")"
     mkdir -p "${dir}"
     cp "${SRC_DIR}/${file}" "${DEST_DIR}/${file}"
 done
+
+# Drop excluded trees left over from earlier syncs
+rm -rf "${DEST_DIR}/tests"
 
 # 2. Sanitization pass
 cd "${DEST_DIR}"

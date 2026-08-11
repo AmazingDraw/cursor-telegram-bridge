@@ -178,6 +178,14 @@ def _parse_tool_args(args: Any) -> dict[str, Any]:
     return {}
 
 
+def _path_within_roots(path: Path, roots: list[Path]) -> bool:
+    try:
+        resolved = path.resolve()
+    except OSError:
+        return False
+    return any(resolved == root or root in resolved.parents for root in roots)
+
+
 def _generate_image_candidates(args: Any, cwd: str) -> list[Path]:
     """Likely output paths from GenerateImage args (may not exist on disk yet)."""
     data = _parse_tool_args(args)
@@ -189,13 +197,26 @@ def _generate_image_candidates(args: Any, cwd: str) -> list[Path]:
 
     candidates: list[Path] = []
     seen: set[str] = set()
+    roots = _allowed_roots(cwd)
     for name in names:
-        basename = Path(name).name
-        for root in _allowed_roots(cwd):
-            for rel in (name, basename, f"assets/{basename}", f"assets/{name}"):
+        # Never join absolute / ..-escaping paths as-is — Path(root)/"/etc/x"
+        # discards root on POSIX. Only keep basename + safe relative forms.
+        raw = Path(name)
+        basename = raw.name
+        if not basename or basename in (".", ".."):
+            continue
+        rels: list[str] = [basename, f"assets/{basename}"]
+        if not raw.is_absolute() and ".." not in raw.parts:
+            rels.append(str(raw))
+            if not str(raw).startswith("assets/"):
+                rels.append(f"assets/{raw.as_posix()}")
+        for root in roots:
+            for rel in rels:
                 try:
                     p = (root / rel).resolve()
                 except OSError:
+                    continue
+                if not _path_within_roots(p, roots):
                     continue
                 key = str(p)
                 if key in seen:
@@ -209,6 +230,7 @@ def resolve_generate_image_paths(args: Any, result: Any, cwd: str) -> list[Path]
     """Resolved on-disk paths from a completed GenerateImage call."""
     found: list[Path] = []
     seen: set[str] = set()
+    roots = _allowed_roots(cwd)
 
     def add(path: Path | None) -> None:
         if path is None:
@@ -221,6 +243,8 @@ def resolve_generate_image_paths(args: Any, result: Any, cwd: str) -> list[Path]
         if key in seen:
             return
         seen.add(key)
+        if not _path_within_roots(resolved, roots):
+            return
         if resolved.is_file() and not _is_blocked(resolved) and is_sendable(resolved):
             found.append(resolved)
 

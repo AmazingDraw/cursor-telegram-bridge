@@ -8,6 +8,7 @@ multi-bot setups stay peer-aligned.
 from __future__ import annotations
 
 import logging
+import re
 import shutil
 from pathlib import Path
 
@@ -15,20 +16,38 @@ from .config import BotConfig, Config
 
 logger = logging.getLogger(__name__)
 
+_SAFE_BOT_NAME = re.compile(r"[^a-zA-Z0-9._-]+")
+
+
+def sanitize_bot_name(name: str | None, *, fallback: str = "default") -> str:
+    """Collapse a bot name to a single path segment (no ``..`` / separators)."""
+    raw = (name or "").strip() or fallback
+    # Drop any directory components an attacker might put in config.
+    raw = raw.replace("\\", "/").split("/")[-1]
+    cleaned = _SAFE_BOT_NAME.sub("_", raw).strip("._")
+    if not cleaned or cleaned in {".", ".."}:
+        return fallback
+    return cleaned
+
 
 def bot_name_for(bot_cfg: BotConfig | None) -> str:
-    return bot_cfg.name if bot_cfg else "default"
+    return sanitize_bot_name(bot_cfg.name if bot_cfg else None)
 
 
 def bot_state_dir(cfg: Config, bot_name: str | BotConfig | None = None) -> Path:
     """Return ``state/bots/<name>`` for a bot (always peer-level)."""
     if isinstance(bot_name, BotConfig):
-        name = bot_name.name
+        name = sanitize_bot_name(bot_name.name)
     elif isinstance(bot_name, str) and bot_name.strip():
-        name = bot_name.strip()
+        name = sanitize_bot_name(bot_name)
     else:
         name = "default"
     path = cfg.state_dir / "bots" / name
+    # Refuse to create directories outside state/bots (defense in depth).
+    bots_root = (cfg.state_dir / "bots").resolve()
+    resolved = path.resolve()
+    if not resolved.is_relative_to(bots_root):
+        raise ValueError(f"Refusing bot state path outside bots/: {path}")
     path.mkdir(parents=True, exist_ok=True)
     return path
 

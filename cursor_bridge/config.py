@@ -83,7 +83,8 @@ class Config:
     health_poll_fail_threshold: int = 8
     # Quiet period (no successful Telegram traffic) required with failures.
     health_quiet_sec: float = 180.0
-    # Per-bot getMe heartbeat interval; success resets the quiet/failure clock.
+    # Per-bot getMe heartbeat interval. Failure counts as a poll error; success
+    # does not clear poll failures (getMe can work while long-polling is wedged).
     health_heartbeat_interval_sec: float = 30.0
     # Soft restarts before escalating to launchd kickstart (0 = never kickstart).
     health_kickstart_after_soft: int = 2
@@ -190,6 +191,9 @@ def load_config(project_root: Path) -> Config:
             if not isinstance(b_item, dict):
                 continue
             b_name = str(b_item.get("name", f"bot_{idx}")).strip()
+            from .state_layout import sanitize_bot_name
+
+            b_name = sanitize_bot_name(b_name, fallback=f"bot_{idx}")
             b_token = _resolve_bot_token(b_item, default_token=token, bot_name=b_name)
             b_allowed_raw = b_item.get("allowed_user_id")
             if b_allowed_raw is not None:
@@ -375,7 +379,12 @@ def _parse_permission(raw: object) -> str:
     if raw is None:
         return "full"
     val = str(raw).strip().lower()
-    return val if val in _PERMISSIONS else "full"
+    if val in _PERMISSIONS:
+        return val
+    allowed = ", ".join(sorted(_PERMISSIONS))
+    raise SystemExit(
+        f"Invalid bot permission {raw!r}. Use one of: {allowed}."
+    )
 
 
 def _parse_int_list(raw: object) -> list[int]:

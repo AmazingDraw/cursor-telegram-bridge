@@ -642,6 +642,8 @@ class LiveMessage:
         self._pending: str | None = None
         self._flush_task: asyncio.Task | None = None
         self._lock = asyncio.Lock()
+        # True while edit_message_text is in flight — force must not cancel it.
+        self._flushing = False
 
     async def update(self, text: str, force: bool = False) -> None:
         """Queue live text. Never blocks on Telegram (force only shortens delay)."""
@@ -655,9 +657,14 @@ class LiveMessage:
         self._schedule_flush(delay)
 
     def _schedule_flush(self, delay: float) -> None:
-        """Ensure a background flush runs; force/immediate replaces a pending delay."""
+        """Ensure a background flush runs; coalesce instead of canceling in-flight I/O."""
         if delay <= 0.0:
+            if self._flushing:
+                # Network edit already running — keep newest _pending; that flush
+                # (or a follow-up) will push it when done.
+                return
             if self._flush_task is not None and not self._flush_task.done():
+                # Only cancel a *delayed* sleep, not an active Telegram edit.
                 self._flush_task.cancel()
             self._flush_task = asyncio.create_task(self._flush_after(0.0))
             return
@@ -670,7 +677,11 @@ class LiveMessage:
             try:
                 await self._flush_task
             except asyncio.CancelledError:
-                pass
+                # Swallow only when the *flush task* was cancelled (coalesce).
+                # If *this* caller is being cancelled (/cancel), propagate.
+                me = asyncio.current_task()
+                if me is not None and me.cancelling():
+                    raise
             except Exception:  # noqa: BLE001
                 logger.debug("live flush task failed", exc_info=True)
         if self._pending and self._pending != self._last:
@@ -680,53 +691,61 @@ class LiveMessage:
         if delay > 0:
             await asyncio.sleep(delay)
         await self._flush()
+        # If newer text arrived while we were editing, schedule another pass.
+        if self._pending and self._pending != self._last and not self._flushing:
+            self._schedule_flush(0.0)
 
     async def _flush(self) -> None:
-        async with self._lock:
-            out = self._pending
-            if not out or out == self._last:
-                return
-            try:
-                await _await_telegram(lambda: self.bot.edit_message_text(
-                    out,
-                    chat_id=self.chat_id,
-                    message_id=self.message_id,
-                    parse_mode=ParseMode.HTML,
-                ), max_network_retries=_LIVE_TELEGRAM_NETWORK_RETRIES)
-                self._last = out
-                self._last_edit = time.time()
-            except BadRequest as exc:
-                err = str(exc).lower()
-                if "not modified" in err:
+        # Mark before any await so force cannot cancel us while we wait on the lock.
+        self._flushing = True
+        try:
+            async with self._lock:
+                out = self._pending
+                if not out or out == self._last:
+                    return
+                try:
+                    await _await_telegram(lambda: self.bot.edit_message_text(
+                        out,
+                        chat_id=self.chat_id,
+                        message_id=self.message_id,
+                        parse_mode=ParseMode.HTML,
+                    ), max_network_retries=_LIVE_TELEGRAM_NETWORK_RETRIES)
                     self._last = out
                     self._last_edit = time.time()
-                elif "can't parse" in err or "parse" in err:
-                    plain = _plain_fallback(out)
-                    try:
-                        await _await_telegram(lambda: self.bot.edit_message_text(
-                            plain,
-                            chat_id=self.chat_id,
-                            message_id=self.message_id,
-                            parse_mode=None,
-                        ), max_network_retries=_LIVE_TELEGRAM_NETWORK_RETRIES)
-                        self._last = plain
+                except BadRequest as exc:
+                    err = str(exc).lower()
+                    if "not modified" in err:
+                        self._last = out
                         self._last_edit = time.time()
-                    except BadRequest as exc2:
-                        logger.debug("edit_message_text plain fallback failed: %s", exc2)
-                    except NetworkError as exc2:
-                        logger.warning(
-                            "Live message plain fallback failed after retries: %s",
-                            exc2,
-                        )
-                else:
-                    logger.debug("edit_message_text failed: %s", exc)
-            except NetworkError as exc:
-                # Keep _pending so a later flush / final send can retry.
-                # Never raise — heartbeat live edits must not abort the agent run.
-                logger.warning(
-                    "Live message edit failed after retries (will retry later): %s",
-                    exc,
-                )
+                    elif "can't parse" in err or "parse" in err:
+                        plain = _plain_fallback(out)
+                        try:
+                            await _await_telegram(lambda: self.bot.edit_message_text(
+                                plain,
+                                chat_id=self.chat_id,
+                                message_id=self.message_id,
+                                parse_mode=None,
+                            ), max_network_retries=_LIVE_TELEGRAM_NETWORK_RETRIES)
+                            self._last = plain
+                            self._last_edit = time.time()
+                        except BadRequest as exc2:
+                            logger.debug("edit_message_text plain fallback failed: %s", exc2)
+                        except NetworkError as exc2:
+                            logger.warning(
+                                "Live message plain fallback failed after retries: %s",
+                                exc2,
+                            )
+                    else:
+                        logger.debug("edit_message_text failed: %s", exc)
+                except NetworkError as exc:
+                    # Keep _pending so a later flush / final send can retry.
+                    # Never raise — heartbeat live edits must not abort the agent run.
+                    logger.warning(
+                        "Live message edit failed after retries (will retry later): %s",
+                        exc,
+                    )
+        finally:
+            self._flushing = False
 
 
 def _plain_fallback(text: str) -> str:
@@ -1244,6 +1263,12 @@ async def _drain_prompt_queue(context: ContextTypes.DEFAULT_TYPE, s: Session) ->
     mgr = _mgr(context)
     if mgr.is_busy(s):
         return
+    head = mgr.peek_queued_prompt(s.short_id)
+    if head is None:
+        return
+    if not head.confirmed:
+        # Still waiting on the 待确认 keyboard — do not auto-start.
+        return
     item = mgr.pop_queued_prompt(s.short_id)
     if item is None:
         return
@@ -1304,6 +1329,7 @@ async def _start_user_prompt(
             chat_id=chat_id,
             thinking_label=thinking_label,
             log_kind=log_kind,
+            confirmed=False,
         )
         try:
             n = mgr.enqueue_prompt(s.short_id, item)
@@ -1315,7 +1341,7 @@ async def _start_user_prompt(
             chat_id,
             f"📋 <b>新消息待确认</b>（队列第 {n} 条）\n"
             f"<i>{preview}</i>\n\n"
-            "📋 <b>排队</b> — 等当前任务结束后再执行（默认）\n"
+            "📋 <b>排队</b> — 确认后等当前任务结束再执行\n"
             "⚡ <b>发送</b> — 中止当前任务，立刻跑这条\n"
             "❎ <b>取消</b> — 丢掉这条新命令（不影响正在跑的任务）",
             parse_mode=ParseMode.HTML,
@@ -2178,13 +2204,6 @@ async def handle_inbound_media(update: Update, context: ContextTypes.DEFAULT_TYP
             parse_mode=ParseMode.HTML,
         )
         return
-    if mgr.is_busy(s):
-        await update.message.reply_text(
-            f"⏳ <b>{esc(s.name)} 任务运行中</b>\n\n"
-            "请等待当前任务完成，或发送 /cancel 取消。",
-            parse_mode=ParseMode.HTML,
-        )
-        return
 
     try:
         pending = await save_inbound_attachment(update, context, s.cwd)
@@ -2247,8 +2266,8 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             return
 
         if action == "qkeep":
-            # Confirm stay in queue — do not remove the item; only clear buttons.
-            item = mgr.find_queued_by_token(sid, token)
+            # Confirm stay in queue — drain may run it once the session is idle.
+            item = mgr.confirm_queued_by_token(sid, token)
             if item is None:
                 await query.answer("已不在队列中", show_alert=True)
                 try:
@@ -2267,6 +2286,10 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                 )
             except BadRequest:
                 pass
+            try:
+                await _drain_prompt_queue(context, s)
+            except Exception:  # noqa: BLE001
+                logger.exception("prompt queue drain after qkeep failed  session=%s", sid)
             return
 
         item = mgr.remove_queued_by_token(sid, token)

@@ -9,6 +9,7 @@ import time
 from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Awaitable, Callable, Optional
 
 from cursor_sdk import (
@@ -88,11 +89,26 @@ BRIDGE_RUN_ATTEMPTS = 3
 # After hung-run watchdog abort: auto-send this once (same as user typing 继续).
 STALL_AUTO_CONTINUE_PROMPT = "继续"
 STALL_AUTO_CONTINUE_MAX = 1
+# Mid-stream bridge drop after a successful agent resume: do not re-send the
+# original user prompt (would duplicate tool work). Same continue cue as stall.
+BRIDGE_RESUME_CONTINUE_PROMPT = STALL_AUTO_CONTINUE_PROMPT
 
 # Default stall watchdog (overridden by Config.run_stall_timeout_sec).
 DEFAULT_RUN_STALL_TIMEOUT_SEC = 300.0
 # Longer allowance while a tool call is in flight (no new events).
 DEFAULT_RUN_TOOL_STALL_TIMEOUT_SEC = 600.0
+# While consuming SDK events: wake periodically so a stalled+cancelled run
+# cannot hang forever on a silent async iterator.
+EVENT_POLL_TIMEOUT_SEC = 20.0
+# After stall/tool cancel: bound how long we wait for run.wait() to finish.
+POST_CANCEL_WAIT_TIMEOUT_SEC = 45.0
+
+
+def _final_with_partial(text_parts: list[str], message: str) -> str:
+    """Keep streamed assistant text when appending a stall/abort notice."""
+    partial = "".join(text_parts).strip()
+    return f"{partial}\n\n---\n\n{message}" if partial else message
+
 
 # Async callback the bot passes in to receive live transcript updates (force=True bypasses throttle).
 UpdateCb = Callable[..., Awaitable[None]]
@@ -108,6 +124,8 @@ class QueuedPrompt:
     thinking_label: str = "\U0001F4AD thinking\u2026"
     log_kind: str = "Prompt"
     token: str = field(default_factory=lambda: secrets.token_hex(4))
+    # False until the user taps 排队 / 发送 on the ack keyboard — drain must skip.
+    confirmed: bool = True
 
 
 @dataclass
@@ -191,7 +209,13 @@ def _is_stuck_agent(exc: BaseException) -> bool:
     if isinstance(exc, (InternalServerError, AgentBusyError)):
         return True
     text = str(exc).lower()
-    return "internal" in text or "agent busy" in text or "agent_busy" in text
+    # Avoid bare "internal" — matches unrelated errors (e.g. "internal timeout").
+    return (
+        "internal server error" in text
+        or "internal error" in text
+        or "agent busy" in text
+        or "agent_busy" in text
+    )
 
 
 class SessionManager:
@@ -220,6 +244,12 @@ class SessionManager:
         self._run_locks: dict[str, asyncio.Lock] = {}
         self._agent_locks: dict[str, asyncio.Lock] = {}
         self._run_tasks: dict[str, asyncio.Task] = {}
+        # Bumped on each depth-0 run start and on force-unstick so a stale
+        # run_prompt finally cannot clear a successor's lock/task/run.
+        self._run_generations: dict[str, int] = {}
+        # Sid set while a depth-0 run_prompt is between busy-check and lock.acquire
+        # (closes the locked()/await acquire TOCTOU window).
+        self._run_lock_claiming: set[str] = set()
         self._prompt_queues: dict[str, deque[QueuedPrompt]] = {}
         self._load()
 
@@ -233,6 +263,11 @@ class SessionManager:
             lock = asyncio.Lock()
             self._run_locks[sid] = lock
         return lock
+
+    def _bump_run_generation(self, sid: str) -> int:
+        nxt = self._run_generations.get(sid, 0) + 1
+        self._run_generations[sid] = nxt
+        return nxt
 
     def _agent_lock(self, sid: str) -> asyncio.Lock:
         """Serialize resume/recreate for one session (vs background resume)."""
@@ -326,6 +361,8 @@ class SessionManager:
         self._run_locks.clear()
         self._agent_locks.clear()
         self._run_tasks.clear()
+        self._run_generations.clear()
+        self._run_lock_claiming.clear()
         self._prompt_queues.clear()
         for s in list(self.sessions.values()):
             # Stale "running" from a crash/reload — no run is active until a new prompt starts.
@@ -526,6 +563,8 @@ class SessionManager:
         """True when a prompt run is in flight for this session."""
         if s.status == STATUS_RUNNING:
             return True
+        if s.short_id in self._run_lock_claiming:
+            return True
         task = self._run_tasks.get(s.short_id)
         if task is not None and not task.done():
             return True
@@ -545,6 +584,12 @@ class SessionManager:
     def push_front_prompt(self, sid: str, item: QueuedPrompt) -> None:
         self._prompt_queues.setdefault(sid, deque()).appendleft(item)
 
+    def peek_queued_prompt(self, sid: str) -> QueuedPrompt | None:
+        q = self._prompt_queues.get(sid)
+        if not q:
+            return None
+        return q[0]
+
     def pop_queued_prompt(self, sid: str) -> QueuedPrompt | None:
         q = self._prompt_queues.get(sid)
         if not q:
@@ -552,6 +597,14 @@ class SessionManager:
         item = q.popleft()
         if not q:
             self._prompt_queues.pop(sid, None)
+        return item
+
+    def confirm_queued_by_token(self, sid: str, token: str) -> QueuedPrompt | None:
+        """Mark a queued item confirmed so drain may run it. Returns the item or None."""
+        item = self.find_queued_by_token(sid, token)
+        if item is None:
+            return None
+        item.confirmed = True
         return item
 
     def clear_prompt_queue(self, sid: str) -> int:
@@ -846,13 +899,16 @@ class SessionManager:
             except Exception:  # noqa: BLE001
                 pass
 
-    async def _recover_bridge_session(self, s: Session, exc: BaseException) -> None:
+    async def _recover_bridge_session(self, s: Session, exc: BaseException) -> str:
         """Drop a dead bridge, then resume the same agent (or recreate as fallback).
 
         Mid-stream bridge crashes previously always recreated the agent, losing
         the conversation context. When ``try_resume_first`` is enabled (default)
         we first try to resume the old agent on the fresh bridge; only if that
         fails do we fall back to creating a new agent.
+
+        Returns ``\"resumed\"`` or ``\"recreated\"`` so callers can choose whether
+        to re-send the original prompt or a short continue cue.
         """
         logger.warning(
             "Bridge down for session %s (%s); rebuilding and retrying",
@@ -879,7 +935,7 @@ class SessionManager:
                         s.short_id,
                         s.agent_id,
                     )
-                    return
+                    return "resumed"
                 except Exception as resume_exc:  # noqa: BLE001
                     logger.warning(
                         "Resume after bridge rebuild failed for %s (%s); "
@@ -888,6 +944,7 @@ class SessionManager:
                         resume_exc,
                     )
             await self._recreate_agent(s)
+            return "recreated"
 
     async def run_prompt(
         self,
@@ -899,16 +956,26 @@ class SessionManager:
         _depth: int = 0,
         _recreated: bool = False,
     ) -> tuple[str, str, list[Path]]:
+        owned_lock: asyncio.Lock | None = None
+        my_gen: int | None = None
         if _depth == 0:
-            lock = self._run_lock(s.short_id)
-            if lock.locked():
+            sid = s.short_id
+            lock = self._run_lock(sid)
+            # Never wait on the run lock — a second caller must get Busy, not queue.
+            if lock.locked() or sid in self._run_lock_claiming:
                 raise SessionBusyError(
                     "Already running — wait or /cancel first.",
                 )
-            await lock.acquire()
+            self._run_lock_claiming.add(sid)
+            try:
+                await lock.acquire()
+            finally:
+                self._run_lock_claiming.discard(sid)
+            owned_lock = lock
+            my_gen = self._bump_run_generation(sid)
             current = asyncio.current_task()
             if current is not None:
-                self._run_tasks[s.short_id] = current
+                self._run_tasks[sid] = current
             s.status = STATUS_RUNNING
             self._persist()
 
@@ -924,23 +991,34 @@ class SessionManager:
             )
         finally:
             if _depth == 0:
-                self._run_tasks.pop(s.short_id, None)
-                if s.status == STATUS_RUNNING:
-                    s.status = STATUS_IDLE
-                # Only cancel an in-flight SDK run (e.g. task was cancelled).
-                # Successful paths clear s.run before returning.
-                active_run = s.run
-                s.run = None
-                s.run_id = None
-                self._persist()
-                if active_run is not None:
+                still_owner = (
+                    my_gen is not None
+                    and self._run_generations.get(s.short_id) == my_gen
+                )
+                if still_owner:
+                    current = asyncio.current_task()
+                    if self._run_tasks.get(s.short_id) is current:
+                        self._run_tasks.pop(s.short_id, None)
+                    if s.status == STATUS_RUNNING:
+                        s.status = STATUS_IDLE
+                    # Only cancel an in-flight SDK run we still own.
+                    # Successful paths clear s.run before returning.
+                    active_run = s.run
+                    s.run = None
+                    s.run_id = None
+                    self._persist()
+                    if active_run is not None:
+                        try:
+                            await active_run.cancel()  # type: ignore[attr-defined]
+                        except Exception:  # noqa: BLE001
+                            pass
+                # Always release the lock object THIS call acquired — never the
+                # possibly-replaced lock in _run_locks after force-unstick.
+                if owned_lock is not None and owned_lock.locked():
                     try:
-                        await active_run.cancel()  # type: ignore[attr-defined]
-                    except Exception:  # noqa: BLE001
+                        owned_lock.release()
+                    except RuntimeError:
                         pass
-                lock = self._run_lock(s.short_id)
-                if lock.locked():
-                    lock.release()
 
     async def _run_prompt_inner(
         self,
@@ -952,6 +1030,7 @@ class SessionManager:
         _depth: int = 0,
         _recreated: bool = False,
         _stall_retries: int = 0,
+        _carry_text_parts: list[str] | None = None,
     ) -> tuple[str, str, list[Path]]:
         # Backfill config default for sessions created before effort support,
         # or after /model cleared params without re-applying.
@@ -974,8 +1053,9 @@ class SessionManager:
                 if attempt >= BRIDGE_RUN_ATTEMPTS:
                     raise
                 if _is_bridge_down(exc):
-                    await self._recover_bridge_session(s, exc)
-                    recreated = True
+                    outcome = await self._recover_bridge_session(s, exc)
+                    if outcome == "recreated":
+                        recreated = True
                     continue
                 if _is_stuck_agent(exc):
                     logger.warning(
@@ -1010,7 +1090,8 @@ class SessionManager:
         )
         logger.info("Session %s run %s started", s.short_id, s.run_id)
 
-        text_parts: list[str] = []
+        # Keep streamed assistant text across stall auto-continue retries.
+        text_parts: list[str] = list(_carry_text_parts or [])
         tool_hits: list[tuple[str, object, object]] = []
         sent_paths: set[str] = set()
         running_tools: set[str] = set()
@@ -1124,8 +1205,29 @@ class SessionManager:
         permission = (
             (self.bot_cfg.permission if self.bot_cfg else None) or "full"
         )
+        # Defer mid-stream bridge retry until after heartbeat/stall are stopped.
+        # ``return await`` inside this try would run nested work before finally.
+        pending_bridge_retry = False
+        pending_retry_prompt: str | UserMessage = prompt
+        pending_recreated = True
         try:
-            async for event in run.events():
+            event_iter = run.events().__aiter__()
+            while True:
+                if blocked_tool_msg is not None or stalled:
+                    break
+                try:
+                    event = await asyncio.wait_for(
+                        event_iter.__anext__(),
+                        timeout=EVENT_POLL_TIMEOUT_SEC,
+                    )
+                except StopAsyncIteration:
+                    break
+                except asyncio.TimeoutError:
+                    # No event for a while — keep waiting unless watchdog already
+                    # cancelled the run (otherwise we'd hang forever on a dead stream).
+                    if stalled or blocked_tool_msg is not None:
+                        break
+                    continue
                 if blocked_tool_msg is not None:
                     break
                 message = event.sdk_message
@@ -1318,20 +1420,20 @@ class SessionManager:
                     BRIDGE_RUN_ATTEMPTS,
                     exc,
                 )
-                await self._recover_bridge_session(s, exc)
-                return await self._run_prompt_inner(
-                    s,
-                    prompt,
-                    on_update,
-                    on_attachment,
-                    _depth=_depth + 1,
-                    _recreated=True,
-                    _stall_retries=_stall_retries,
-                )
-            s.status = STATUS_ERROR
-            s.run = None
-            self._persist()
-            raise
+                outcome = await self._recover_bridge_session(s, exc)
+                pending_bridge_retry = True
+                if outcome == "resumed":
+                    # Agent kept prior turns — do not re-send the full user prompt.
+                    pending_retry_prompt = BRIDGE_RESUME_CONTINUE_PROMPT
+                    pending_recreated = False
+                else:
+                    pending_retry_prompt = prompt
+                    pending_recreated = True
+            else:
+                s.status = STATUS_ERROR
+                s.run = None
+                self._persist()
+                raise
         finally:
             stop_heartbeat.set()
             for task in (hb_task, stall_task):
@@ -1340,9 +1442,47 @@ class SessionManager:
                     await task
                 except asyncio.CancelledError:
                     pass
+                except Exception:  # noqa: BLE001
+                    logger.debug(
+                        "heartbeat/stall task ended with error for %s",
+                        s.short_id,
+                        exc_info=True,
+                    )
+
+        if pending_bridge_retry:
+            return await self._run_prompt_inner(
+                s,
+                pending_retry_prompt,
+                on_update,
+                on_attachment,
+                _depth=_depth + 1,
+                _recreated=pending_recreated,
+                _stall_retries=_stall_retries,
+            )
 
         try:
-            result = await run.wait()
+            if stalled or blocked_tool_msg is not None:
+                result = await asyncio.wait_for(
+                    run.wait(),
+                    timeout=POST_CANCEL_WAIT_TIMEOUT_SEC,
+                )
+            else:
+                result = await run.wait()
+        except asyncio.TimeoutError:
+            logger.error(
+                "Session %s run.wait timed out after cancel/stall "
+                "(timeout=%.0fs) — forcing cancelled",
+                s.short_id,
+                POST_CANCEL_WAIT_TIMEOUT_SEC,
+            )
+            self.event_log.append(
+                s.short_id,
+                "run_wait_timeout",
+                timeout_sec=int(POST_CANCEL_WAIT_TIMEOUT_SEC),
+                run_id=s.run_id,
+            )
+            result = SimpleNamespace(status="cancelled", result=None)
+            stalled = True
         except Exception as exc:
             if _is_bridge_down(exc) and _depth + 1 < BRIDGE_RUN_ATTEMPTS:
                 logger.warning(
@@ -1353,14 +1493,17 @@ class SessionManager:
                     BRIDGE_RUN_ATTEMPTS,
                     exc,
                 )
-                await self._recover_bridge_session(s, exc)
+                outcome = await self._recover_bridge_session(s, exc)
+                retry_prompt: str | UserMessage = (
+                    BRIDGE_RESUME_CONTINUE_PROMPT if outcome == "resumed" else prompt
+                )
                 return await self._run_prompt_inner(
                     s,
-                    prompt,
+                    retry_prompt,
                     on_update,
                     on_attachment,
                     _depth=_depth + 1,
-                    _recreated=True,
+                    _recreated=(outcome == "recreated"),
                     _stall_retries=_stall_retries,
                 )
             s.status = STATUS_ERROR
@@ -1420,7 +1563,7 @@ class SessionManager:
                 s.run_id = None
                 s.status = STATUS_RUNNING
                 self._persist()
-                # Same agent +「继续」— mirrors the user sending continue manually.
+                # Same agent +「继续」— keep any streamed text from before the stall.
                 return await self._run_prompt_inner(
                     s,
                     auto_continue_prompt,
@@ -1429,13 +1572,15 @@ class SessionManager:
                     _depth=_depth,
                     _recreated=recreated,
                     _stall_retries=_stall_retries + 1,
+                    _carry_text_parts=text_parts,
                 )
-            final = (
+            abort_msg = (
                 f"**Run aborted:** no agent progress for {int(stalled_limit)}s "
                 "(hung run watchdog).\n\n"
                 f"Already auto-retried {auto_continue_max} time(s) with「{auto_continue_prompt}」. "
                 "Send the prompt again, or `/reload` if this keeps happening."
             )
+            final = _final_with_partial(text_parts, abort_msg)
         else:
             sdk_final = getattr(result, "result", None)
             final = resolve_final_body(
@@ -1580,7 +1725,13 @@ class SessionManager:
         return False
 
     def _force_unstick(self, s: Session) -> None:
-        """Drop an orphaned run lock when no live task/run handle exists."""
+        """Drop an orphaned run lock when cancel cannot finish the coroutine.
+
+        Bumps the run generation first so a stale ``run_prompt`` finally cannot
+        clear a successor's task/run or release the replacement lock.
+        """
+        self._bump_run_generation(s.short_id)
+        self._run_lock_claiming.discard(s.short_id)
         if self._run_lock(s.short_id).locked():
             self._run_locks[s.short_id] = asyncio.Lock()
         self._run_tasks.pop(s.short_id, None)

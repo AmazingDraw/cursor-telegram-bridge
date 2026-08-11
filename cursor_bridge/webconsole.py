@@ -427,6 +427,11 @@ class _ConsoleHandler(BaseHTTPRequestHandler):
         self._text(404, "Not found", "text/plain; charset=utf-8")
 
 
+def _is_loopback_host(host: str) -> bool:
+    h = (host or "").strip().lower()
+    return h in {"127.0.0.1", "::1", "localhost"}
+
+
 class WebConsole:
     def __init__(self, cfg: Config) -> None:
         self.cfg = cfg
@@ -438,6 +443,15 @@ class WebConsole:
             return
         host = self.cfg.console_host
         port = self.cfg.console_port
+        if not _is_loopback_host(host) and not self.cfg.console_token:
+            import logging
+            logging.getLogger("cursor_bridge").error(
+                "Web console refused to bind %s:%s without CONSOLE_TOKEN "
+                "(non-loopback hosts require a token)",
+                host,
+                port,
+            )
+            return
         try:
             self._http = _ConsoleServer((host, port), self.cfg)
         except OSError as exc:

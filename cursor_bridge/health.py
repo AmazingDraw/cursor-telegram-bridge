@@ -69,6 +69,8 @@ class HealthProbe:
         self.state.last_ok_at = time.time()
         self.state.consecutive_poll_failures = 0
         self.state.updater_alive = True
+        # Sustained poll/owner health — allow soft restart before kickstart again.
+        self.state.soft_restarts = 0
 
     def note_poll_error(self, err: BaseException | None = None) -> None:
         self.state.last_poll_error_at = time.time()
@@ -110,11 +112,10 @@ class HealthProbe:
                 pass
 
     async def _heartbeat_loop(self) -> None:
-        """Periodically ping Telegram and refresh liveness on success.
+        """Periodically ping Telegram; failure counts toward poll errors.
 
-        Success resets the poll-failure counter and the quiet clock, so the
-        probe measures real Telegram reachability instead of "did the owner
-        happen to send a message lately".
+        Success must *not* call ``note_ok()`` — getMe can succeed while long
+        polling is wedged, and clearing poll failures would hide that.
         """
         while not self._stop.is_set():
             await self._heartbeat_tick()
@@ -129,7 +130,6 @@ class HealthProbe:
     async def _heartbeat_tick(self) -> None:
         try:
             await self.heartbeat_cb()
-            self.note_ok()
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # noqa: BLE001
@@ -168,7 +168,7 @@ class HealthProbe:
         quiet = now - self.state.last_ok_at
         wedged = updater_dead or (
             failures >= self.poll_fail_threshold
-            and quiet >= min(self.quiet_sec, 120.0)
+            and quiet >= self.quiet_sec
         )
         if not wedged:
             return
