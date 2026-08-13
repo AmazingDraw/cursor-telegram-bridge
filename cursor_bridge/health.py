@@ -31,10 +31,18 @@ class HealthState:
     soft_restarts: int = 0
     last_recovery_at: float = 0.0
     updater_alive: bool = True
+    # True while a wedge episode is ongoing (first alert already sent).
+    episode_open: bool = False
 
 
 class HealthProbe:
-    """Background probe that heals a wedged Telegram poller."""
+    """Background probe that heals a wedged Telegram poller.
+
+    Notifications are episode-based: the first wedge of an outage notifies
+    once, further soft restarts in the same episode stay silent, and only
+    kickstart escalation or sustained recovery notifies again — a long
+    network outage must not spam the owner every check cycle.
+    """
 
     def __init__(
         self,
@@ -186,7 +194,14 @@ class HealthProbe:
                     "Health probe: sustained healthy for %.0fs — resetting soft_restarts",
                     healthy_for,
                 )
+                if self.state.episode_open:
+                    await self._notify(
+                        "✅ Health probe: Telegram poll recovered — "
+                        f"episode closed after {self.state.soft_restarts} "
+                        "soft restart(s)."
+                    )
                 self.state.soft_restarts = 0
+                self.state.episode_open = False
             return
 
         reason = (
@@ -211,14 +226,25 @@ class HealthProbe:
             return
 
         if self.soft_restart_cb is not None:
-            msg = (
-                "🩺 Health probe: Telegram poll unhealthy — "
-                f"soft restart ({self.state.soft_restarts + 1}).\n"
-                f"<code>{reason}</code>"
-            )
-            await self._notify(msg)
             self.state.soft_restarts += 1
             self.state.last_recovery_at = now
+            if not self.state.episode_open:
+                # First wedge of this outage — notify once; later restarts in
+                # the same episode stay silent until recovery or kickstart.
+                self.state.episode_open = True
+                msg = (
+                    "🩺 Health probe: Telegram poll unhealthy — "
+                    f"soft restart ({self.state.soft_restarts}).\n"
+                    f"<code>{reason}</code>\n"
+                    "Further restarts in this episode stay silent; "
+                    "you'll hear from me on recovery or kickstart."
+                )
+                await self._notify(msg)
+            else:
+                logger.warning(
+                    "Health probe: still wedged — silent soft restart (%s)",
+                    self.state.soft_restarts,
+                )
             result = self.soft_restart_cb()
             if inspect.isawaitable(result):
                 await result
