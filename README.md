@@ -6,38 +6,7 @@
 
 ## 架构
 
-```text
-               📱 Telegram App (Mobile)
-                          │
-                          │ HTTPS Long-Polling
-                          ▼
-┌──────────────────────────────────────────────────────────┐
-│ 💻 Mac Host Environment                                  │
-│                                                          │
-│ ┌──────────────────────────────────────────────────────┐ │
-│ │ 🚀 cursor-telegram-bridge (Python Core Service)      │ │
-│ │    Multi-Bot Routing · Health Probe · Event Loop     │ │
-│ └───────────┬──────────────────┬──────────────────┬────┘ │
-│             │                  │                  │      │
-│             ▼                  ▼                  ▼      │
-│ ┌──────────────────┐ ┌──────────────────┐ ┌────────────┐ │
-│ │ 💾 Local State   │ │ 🌐 Web Dashboard │ │ 💬 Delivery│ │
-│ │ sessions.json    │ │ http://127.0.0.1 │ │ LiveMsg /  │ │
-│ │ outbox.jsonl     │ │ port :9477       │ │ Outbox     │ │
-│ └──────────────────┘ └──────────────────┘ └────────────┘ │
-│                                                          │
-│ ┌──────────────────────────────────────────────────────┐ │
-│ │ 🔌 Cursor SDK Bridge Subprocess                      │ │
-│ │    Isolated bridge process spawned per folder        │ │
-│ └──────────────────────────┬───────────────────────────┘ │
-│                            │                             │
-│                            ▼                             │
-│ ┌──────────────────────────────────────────────────────┐ │
-│ │ 🤖 Local Agent (Headless Runner)                     │ │
-│ │    cwd = Project Directory · Shell & File Tools      │ │
-│ └──────────────────────────────────────────────────────┘ │
-└──────────────────────────────────────────────────────────┘
-```
+![Cursor Telegram Bridge 架构图](./architecture.svg)
 
 - 仅响应 `ALLOWED_TELEGRAM_USER_ID`（可按 bot 配置群白名单）。
 - 每文件夹一个 Cursor bridge；会话记在 `state/bots/<name>/`，重启可 resume。
