@@ -89,7 +89,7 @@ Live 回复在同一条消息里原地更新（工具活动 + 最终 HTML）。�
 
 **`.env`（勿提交）**：`TELEGRAM_BOT_TOKEN_1`、`CURSOR_API_KEY`、`ALLOWED_TELEGRAM_USER_ID`；可选 `TELEGRAM_BOT_TOKEN_2`、`CONSOLE_TOKEN`。
 
-**`config.toml`**：`projects_root`、`model` / `models`、`effort`、`busy_policy`、`rules_file`、`[[bookmarks]]`、`[[bots]]`（多 bot、`permission`、`allowed_chat_ids`）等。细节见文件内注释。
+**`config.toml`**：`projects_root`、`model` / `models`、`effort`、`busy_policy`、`rules_file`、`[model_context_windows]`（仅 Bridge UI 上下文估算分母，不改 Cursor 真实截断）、`[[bookmarks]]`、`[[bots]]`（多 bot、`permission`、`allowed_chat_ids`）等。细节见文件内注释。
 
 多 bot 时各 bot 会话目录独立（`state/bots/<name>/`），共用 API Key 与 `rules.md`。`permission = "readonly"` 只允许读类工具且路径不离会话目录。
 

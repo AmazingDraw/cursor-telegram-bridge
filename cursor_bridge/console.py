@@ -9,7 +9,7 @@ from datetime import datetime
 from pathlib import Path
 
 from .config import load_config
-from .context import format_context_line, get_context_info
+from .context import format_context_line, get_context_info, resolve_context_window
 from .webconsole import _err_log_path, _load_all_sessions
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -91,7 +91,13 @@ def _render(cfg, *, log_path: Path) -> str:
             sid = s.get("short_id", "?")
             star = " \u2605" if sid in active_ids else ""
             badge = _badge(str(s.get("status", "idle")))
-            ctx = get_context_info(s.get("agent_id"), s.get("cwd", ""))
+            window = resolve_context_window(
+                str(s.get("model") or ""),
+                cfg.model_context_windows,
+            )
+            ctx = get_context_info(
+                s.get("agent_id"), s.get("cwd", ""), window=window,
+            )
             prompt = (s.get("last_prompt") or "")[:60]
             if len(s.get("last_prompt") or "") > 60:
                 prompt += "\u2026"

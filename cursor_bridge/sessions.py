@@ -5,12 +5,13 @@ import json
 import logging
 import os
 import secrets
+import threading
 import time
 from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, Awaitable, Callable, Optional
+from typing import Any, AsyncIterator, Awaitable, Callable, Optional
 
 from cursor_sdk import (
     AgentOptions,
@@ -39,6 +40,7 @@ from .context import (
     list_prior_agents,
     prior_context_path,
     PriorAgentInfo,
+    resolve_context_window,
     resolve_prior_agent,
 )
 from .events import SessionEventLog
@@ -66,6 +68,16 @@ from .telegram_delivery import strip_telegram_delivery_prefix
 from .permission_guard import evaluate_tool_call
 
 logger = logging.getLogger("cursor_bridge.sessions")
+
+# ``AsyncClient.launch_bridge`` does not expose a subprocess cwd parameter, so
+# _get_bridge temporarily wraps asyncio.create_subprocess_exec. That symbol is
+# process-global: serialize the wrapper across all bot SessionManagers.
+_PROCESS_BRIDGE_SPAWN_LOCK = threading.Lock()
+
+
+async def _acquire_process_bridge_spawn_lock() -> None:
+    while not _PROCESS_BRIDGE_SPAWN_LOCK.acquire(blocking=False):
+        await asyncio.sleep(0.01)
 
 
 class SessionBusyError(Exception):
@@ -102,6 +114,42 @@ DEFAULT_RUN_TOOL_STALL_TIMEOUT_SEC = 600.0
 EVENT_POLL_TIMEOUT_SEC = 20.0
 # After stall/tool cancel: bound how long we wait for run.wait() to finish.
 POST_CANCEL_WAIT_TIMEOUT_SEC = 45.0
+
+
+async def _iter_events_until_stopped(
+    event_iter: Any,
+    *,
+    should_stop: Callable[[], bool],
+    poll_timeout: float = EVENT_POLL_TIMEOUT_SEC,
+) -> AsyncIterator[Any]:
+    """Poll one persistent ``anext`` task until an event or stop condition.
+
+    ``asyncio.wait_for(event_iter.__anext__(), timeout)`` cancels ``__anext__``
+    on every quiet interval. For the Cursor SDK that cancellation closes the
+    underlying async generator, silently ending all subsequent live events.
+    Reusing one task preserves the stream; it is cancelled only when the run is
+    deliberately stopping.
+    """
+    pending: asyncio.Task | None = None
+    try:
+        while not should_stop():
+            if pending is None:
+                pending = asyncio.create_task(event_iter.__anext__())
+            done, _ = await asyncio.wait({pending}, timeout=poll_timeout)
+            if not done:
+                continue
+
+            completed = pending
+            pending = None
+            try:
+                event = completed.result()
+            except StopAsyncIteration:
+                return
+            yield event
+    finally:
+        if pending is not None and not pending.done():
+            pending.cancel()
+            await asyncio.gather(pending, return_exceptions=True)
 
 
 def _final_with_partial(text_parts: list[str], message: str) -> str:
@@ -239,6 +287,10 @@ class SessionManager:
 
         self._bridges: dict[str, tuple[AsyncClient, object]] = {}
         self._bridge_lock = asyncio.Lock()
+        self._bridge_recovery_locks: dict[str, asyncio.Lock] = {}
+        self._bridge_stderr_tasks: dict[str, asyncio.Task] = {}
+        self._background_tasks: set[asyncio.Task] = set()
+        self._stopping = False
         self.sessions: dict[str, Session] = {}
         self.active: dict[int, str] = {}  # telegram chat_id -> session short_id
         self._counter = 0
@@ -281,20 +333,49 @@ class SessionManager:
             self._agent_locks[sid] = lock
         return lock
 
+    def _bridge_recovery_lock(self, cwd: str) -> asyncio.Lock:
+        key = self._norm(cwd)
+        lock = self._bridge_recovery_locks.get(key)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._bridge_recovery_locks[key] = lock
+        return lock
+
+    def _track_background_task(self, task: asyncio.Task) -> None:
+        self._background_tasks.add(task)
+
+        def _done(completed: asyncio.Task) -> None:
+            self._background_tasks.discard(completed)
+            if completed.cancelled():
+                return
+            try:
+                exc = completed.exception()
+            except asyncio.CancelledError:
+                return
+            if exc is not None:
+                logger.warning("Session background task failed: %s", exc, exc_info=exc)
+
+        task.add_done_callback(_done)
+
     @staticmethod
     def _norm(cwd: str) -> str:
         return os.path.realpath(os.path.expanduser(cwd))
 
     async def _get_bridge(self, cwd: str) -> AsyncClient:
         """Return (launching if needed) the bridge rooted at ``cwd``."""
+        if self._stopping:
+            raise RuntimeError("Session manager is stopping; bridge launch refused")
         key = self._norm(cwd)
         async with self._bridge_lock:
+            if self._stopping:
+                raise RuntimeError("Session manager is stopping; bridge launch refused")
             existing = self._bridges.get(key)
             if existing is not None:
                 return existing[0]
             # SDK bridge inherits the parent process cwd at spawn time, but
             # os.chdir() is process-global and unsafe across awaits. Inject cwd=
             # into the subprocess spawn instead.
+            await _acquire_process_bridge_spawn_lock()
             real_exec = asyncio.create_subprocess_exec
 
             async def _exec_with_cwd(*args: Any, **kwargs: Any):
@@ -304,8 +385,12 @@ class SessionManager:
             asyncio.create_subprocess_exec = _exec_with_cwd  # type: ignore[assignment]
             try:
                 client = await AsyncClient.launch_bridge(workspace=key)
+                if self._stopping:
+                    await client.__aexit__(None, None, None)
+                    raise RuntimeError("Session manager stopped during bridge launch")
                 # Client owns the bridge; __aexit__/aclose terminates it.
                 self._bridges[key] = (client, client)
+                self._start_bridge_stderr_drain(key, client)
                 logger.info("Launched bridge for %s", key)
                 return client
             except Exception as exc:  # noqa: BLE001
@@ -321,6 +406,65 @@ class SessionManager:
                 raise
             finally:
                 asyncio.create_subprocess_exec = real_exec  # type: ignore[assignment]
+                _PROCESS_BRIDGE_SPAWN_LOCK.release()
+
+    async def _drain_bridge_stderr(self, key: str, stream: Any) -> None:
+        """Continuously drain bridge stderr so the child cannot block on a full pipe."""
+        while True:
+            line = await stream.readline()
+            if not line:
+                return
+            text = line.decode(errors="replace").rstrip()
+            if text:
+                logger.debug("Bridge[%s] stderr: %s", Path(key).name, text)
+
+    def _start_bridge_stderr_drain(self, key: str, client: AsyncClient) -> None:
+        bridge = getattr(client, "_owned_bridge", None)
+        process = getattr(bridge, "process", None)
+        stream = getattr(process, "stderr", None)
+        if stream is None:
+            return
+        task = asyncio.create_task(
+            self._drain_bridge_stderr(key, stream),
+            name=f"bridge-stderr-{Path(key).name}",
+        )
+        self._bridge_stderr_tasks[key] = task
+
+        def _done(completed: asyncio.Task) -> None:
+            if self._bridge_stderr_tasks.get(key) is completed:
+                self._bridge_stderr_tasks.pop(key, None)
+            if completed.cancelled():
+                return
+            try:
+                exc = completed.exception()
+            except asyncio.CancelledError:
+                return
+            if exc is not None:
+                logger.debug("Bridge stderr drain ended with error", exc_info=exc)
+
+        task.add_done_callback(_done)
+
+    async def _close_bridge_entry(
+        self,
+        key: str,
+        entry: tuple[AsyncClient, object],
+        stderr_task: asyncio.Task | None = None,
+    ) -> None:
+        try:
+            await asyncio.wait_for(
+                entry[1].__aexit__(None, None, None),  # type: ignore[attr-defined]
+                timeout=15.0,
+            )
+        except asyncio.TimeoutError:
+            logger.warning("Timed out closing bridge for %s", key)
+        except Exception:  # noqa: BLE001
+            logger.debug("Bridge close failed for %s", key, exc_info=True)
+        if stderr_task is not None and not stderr_task.done():
+            try:
+                await asyncio.wait_for(asyncio.shield(stderr_task), timeout=1.0)
+            except asyncio.TimeoutError:
+                stderr_task.cancel()
+                await asyncio.gather(stderr_task, return_exceptions=True)
 
     async def _control_client(self) -> AsyncClient:
         """Dedicated bridge for folder-independent API calls (models, usage, …).
@@ -332,14 +476,13 @@ class SessionManager:
 
     async def _maybe_close_bridge(self, cwd: str) -> None:
         key = self._norm(cwd)
-        if any(self._norm(s.cwd) == key for s in self.sessions.values()):
-            return
-        entry = self._bridges.pop(key, None)
+        async with self._bridge_lock:
+            if any(self._norm(s.cwd) == key for s in self.sessions.values()):
+                return
+            entry = self._bridges.pop(key, None)
+            stderr_task = self._bridge_stderr_tasks.pop(key, None)
         if entry is not None:
-            try:
-                await entry[1].__aexit__(None, None, None)  # type: ignore[attr-defined]
-            except Exception:  # noqa: BLE001
-                pass
+            await self._close_bridge_entry(key, entry, stderr_task)
             logger.info("Closed bridge for %s", key)
 
     # ---- lifecycle ---------------------------------------------------------
@@ -350,6 +493,7 @@ class SessionManager:
         Resume launches Cursor bridges and can block for a long time — Telegram
         polling must not wait on it.
         """
+        self._stopping = False
         path = self.sessions_file
         should_recover = not path.exists()
         if not should_recover:
@@ -377,6 +521,8 @@ class SessionManager:
     async def resume_sessions(self) -> None:
         """Re-attach Cursor agents for persisted sessions (may take a while)."""
         for s in list(self.sessions.values()):
+            if self._stopping:
+                return
             try:
                 async with self._agent_lock(s.short_id):
                     await self._resume(s)
@@ -386,14 +532,37 @@ class SessionManager:
         self._persist()
 
     async def stop(self) -> None:
+        self._stopping = True
+        current = asyncio.current_task()
+        tasks = set(self._background_tasks)
+        tasks.update(self._run_tasks.values())
+        tasks.discard(current)
+        live_tasks = [task for task in tasks if not task.done()]
+        for task in live_tasks:
+            task.cancel()
+        if live_tasks:
+            await asyncio.gather(*live_tasks, return_exceptions=True)
+        self._background_tasks.clear()
+
         for s in self.sessions.values():
-            await self._close_agent(s)
-        for _key, (_client, cm) in list(self._bridges.items()):
             try:
-                await cm.__aexit__(None, None, None)  # type: ignore[attr-defined]
-            except Exception:  # noqa: BLE001
-                pass
-        self._bridges.clear()
+                await asyncio.wait_for(self._close_agent(s), timeout=10.0)
+            except asyncio.TimeoutError:
+                logger.warning("Timed out closing agent for session %s", s.short_id)
+
+        async with self._bridge_lock:
+            entries = list(self._bridges.items())
+            self._bridges.clear()
+            stderr_tasks = dict(self._bridge_stderr_tasks)
+            self._bridge_stderr_tasks.clear()
+        if entries:
+            await asyncio.gather(
+                *(
+                    self._close_bridge_entry(key, entry, stderr_tasks.get(key))
+                    for key, entry in entries
+                ),
+                return_exceptions=True,
+            )
 
     async def _close_agent(self, s: Session) -> None:
         if s.agent is not None:
@@ -802,7 +971,8 @@ class SessionManager:
         return s.name
 
     def session_context(self, s: Session) -> ContextInfo | None:
-        return get_context_info(s.agent_id, s.cwd)
+        window = resolve_context_window(s.model, self.cfg.model_context_windows)
+        return get_context_info(s.agent_id, s.cwd, window=window)
 
     def _backfill_prior_agents(self, s: Session) -> None:
         """Recover prior agent ids from this session's event log only."""
@@ -946,15 +1116,39 @@ class SessionManager:
 
     # ---- running prompts ---------------------------------------------------
 
-    async def _drop_bridge(self, cwd: str) -> None:
-        """Close and forget the cached bridge for ``cwd`` (e.g. after it died)."""
+    async def _drop_bridge(
+        self,
+        cwd: str,
+        *,
+        expected_client: AsyncClient | None = None,
+    ) -> bool:
+        """Close one failed bridge generation and invalidate all peer agents.
+
+        ``expected_client`` is a compare-and-swap guard: a concurrent recovery
+        must never remove the fresh bridge installed by an earlier waiter.
+        """
         key = self._norm(cwd)
-        entry = self._bridges.pop(key, None)
+        # Every agent bound to the failed client is stale, including sessions
+        # other than the one that first observed the disconnect.
+        for peer in self.sessions.values():
+            if self._norm(peer.cwd) != key or peer.agent is None:
+                continue
+            peer_client = getattr(peer.agent, "client", None)
+            if expected_client is None or peer_client is expected_client:
+                peer.agent = None
+
+        async with self._bridge_lock:
+            current = self._bridges.get(key)
+            if current is None:
+                return False
+            if expected_client is not None and current[0] is not expected_client:
+                return False
+            entry = self._bridges.pop(key)
+            stderr_task = self._bridge_stderr_tasks.pop(key, None)
         if entry is not None:
-            try:
-                await entry[1].__aexit__(None, None, None)  # type: ignore[attr-defined]
-            except Exception:  # noqa: BLE001
-                pass
+            await self._close_bridge_entry(key, entry, stderr_task)
+            return True
+        return False
 
     async def _recover_bridge_session(self, s: Session, exc: BaseException) -> str:
         """Drop a dead bridge, then resume the same agent (or recreate as fallback).
@@ -972,36 +1166,42 @@ class SessionManager:
             s.short_id,
             exc,
         )
-        await self._drop_bridge(s.cwd)
-        async with self._agent_lock(s.short_id):
-            if self._try_resume_first and s.agent_id:
-                await self._close_agent(s)
-                try:
-                    await self._resume(s)
-                    s.status = STATUS_IDLE
-                    s.run = None
-                    s.run_id = None
-                    self._persist()
-                    self.log_session_event(
-                        s.short_id,
-                        "agent_resumed_after_bridge_rebuild",
-                        agent_id=s.agent_id,
-                    )
-                    logger.warning(
-                        "Resumed session %s after bridge rebuild (agent %s)",
-                        s.short_id,
-                        s.agent_id,
-                    )
-                    return "resumed"
-                except Exception as resume_exc:  # noqa: BLE001
-                    logger.warning(
-                        "Resume after bridge rebuild failed for %s (%s); "
-                        "recreating agent instead",
-                        s.short_id,
-                        resume_exc,
-                    )
-            await self._recreate_agent(s)
-            return "recreated"
+        if self._stopping:
+            raise RuntimeError("Session manager is stopping; recovery refused")
+        failed_client = getattr(s.agent, "client", None) if s.agent is not None else None
+        if failed_client is None and s.run is not None:
+            failed_client = getattr(s.run, "client", None)
+        async with self._bridge_recovery_lock(s.cwd):
+            await self._drop_bridge(s.cwd, expected_client=failed_client)
+            async with self._agent_lock(s.short_id):
+                if self._try_resume_first and s.agent_id:
+                    await self._close_agent(s)
+                    try:
+                        await self._resume(s)
+                        s.status = STATUS_IDLE
+                        s.run = None
+                        s.run_id = None
+                        self._persist()
+                        self.log_session_event(
+                            s.short_id,
+                            "agent_resumed_after_bridge_rebuild",
+                            agent_id=s.agent_id,
+                        )
+                        logger.warning(
+                            "Resumed session %s after bridge rebuild (agent %s)",
+                            s.short_id,
+                            s.agent_id,
+                        )
+                        return "resumed"
+                    except Exception as resume_exc:  # noqa: BLE001
+                        logger.warning(
+                            "Resume after bridge rebuild failed for %s (%s); "
+                            "recreating agent instead",
+                            s.short_id,
+                            resume_exc,
+                        )
+                await self._recreate_agent(s)
+                return "recreated"
 
     async def run_prompt(
         self,
@@ -1272,22 +1472,10 @@ class SessionManager:
         pending_recreated = True
         try:
             event_iter = run.events().__aiter__()
-            while True:
-                if blocked_tool_msg is not None or stalled:
-                    break
-                try:
-                    event = await asyncio.wait_for(
-                        event_iter.__anext__(),
-                        timeout=EVENT_POLL_TIMEOUT_SEC,
-                    )
-                except StopAsyncIteration:
-                    break
-                except asyncio.TimeoutError:
-                    # No event for a while — keep waiting unless watchdog already
-                    # cancelled the run (otherwise we'd hang forever on a dead stream).
-                    if stalled or blocked_tool_msg is not None:
-                        break
-                    continue
+            async for event in _iter_events_until_stopped(
+                event_iter,
+                should_stop=lambda: blocked_tool_msg is not None or stalled,
+            ):
                 if blocked_tool_msg is not None:
                     break
                 message = event.sdk_message
@@ -1391,7 +1579,9 @@ class SessionManager:
                                             "Session %s live attachment: %s", sid, p.name,
                                         )
 
-                                asyncio.create_task(_poll_image())
+                                self._track_background_task(
+                                    asyncio.create_task(_poll_image())
+                                )
 
                             if tstatus == "error":
                                 live["activity"] = (

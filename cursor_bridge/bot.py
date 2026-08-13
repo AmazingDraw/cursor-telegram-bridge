@@ -1069,10 +1069,16 @@ def _model_callback(m: str) -> str:
 
 
 def _models_keyboard(models: list[str], current: str) -> InlineKeyboardMarkup:
+    row: list[InlineKeyboardButton] = []
     rows: list[list[InlineKeyboardButton]] = []
     for m in models:
         label = model_picker_label(m, current=(m == current))
-        rows.append([InlineKeyboardButton(label, callback_data=_model_callback(m))])
+        row.append(InlineKeyboardButton(label, callback_data=_model_callback(m)))
+        if len(row) == 2:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
     return InlineKeyboardMarkup(rows)
 
 
@@ -2616,7 +2622,6 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                 "重新加载配置与会话状态，恢复在线时会自动通知您。",
                 parse_mode=ParseMode.HTML,
             )
-            asyncio.create_task(_stop_after_reply(context.application))
         elif action == "reload":
             if not _is_owner(update, context):
                 await query.answer("仅主人可重载守护进程。", show_alert=True)
@@ -2725,12 +2730,6 @@ async def _delayed_restart_notify(app: Application) -> None:
     await _send_restart_notify(app)
 
 
-async def _stop_after_reply(app: Application) -> None:
-    """Stop polling on the next event-loop tick so the handler can finish cleanly."""
-    await asyncio.sleep(0.3)
-    app.stop_running()
-
-
 def _launchd_target() -> str:
     """launchctl domain path for this user's LaunchAgent."""
     return f"gui/{os.getuid()}/{LAUNCHD_LABEL}"
@@ -2749,8 +2748,16 @@ async def _kickstart_after_reply(cfg: Config) -> None:
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
-    await proc.communicate()
-    # kickstart -k terminates this process; if we reach here it likely failed.
+    stdout, stderr = await proc.communicate()
+    # kickstart -k normally terminates this process. If it returns, report the
+    # failure and let the already-written restart flag drive graceful recovery.
+    if proc.returncode:
+        logger.error(
+            "launchctl kickstart failed rc=%s stdout=%s stderr=%s",
+            proc.returncode,
+            stdout.decode(errors="replace").strip(),
+            stderr.decode(errors="replace").strip(),
+        )
 
 
 async def cmd_reload(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2781,7 +2788,6 @@ async def cmd_restart(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         "重新加载配置与会话状态，恢复在线时会自动通知您。",
         parse_mode=ParseMode.HTML,
     )
-    asyncio.create_task(_stop_after_reply(context.application))
 
 
 # --------------------------------------------------------------------------
@@ -2848,7 +2854,6 @@ async def _post_init(app: Application) -> None:
     _print_startup_banner(cfg, mgr, bot_cfg)
     _clear_restart_request(cfg)
     _log_action("Bridge ready", bot=bot_cfg.name if bot_cfg else "default", sessions=len(mgr.sessions))
-    _start_health_probe(app, cfg, bot_cfg)
     outbox: TelegramOutbox | None = app.bot_data.get("outbox")
     if outbox is not None:
         outbox.start(_make_outbox_sender(app))
@@ -2890,10 +2895,37 @@ async def _post_init(app: Application) -> None:
         logger.warning("set_my_commands failed: %s", exc)
 
 
-async def _post_shutdown(app: Application) -> None:
+async def _stop_health_probe(app: Application) -> None:
     probe: HealthProbe | None = app.bot_data.get("health_probe")
     if probe is not None:
         await probe.stop()
+        app.bot_data["health_probe"] = None
+
+
+async def _cancel_app_background_tasks(app: Application) -> None:
+    """Cancel tasks owned by this app before closing its Cursor bridges."""
+    current = asyncio.current_task()
+    tasks: set[asyncio.Task] = set(app.bot_data.get("_bg_tasks", set()))
+    resume_task = app.bot_data.get("resume_task")
+    if isinstance(resume_task, asyncio.Task):
+        tasks.add(resume_task)
+    tasks.discard(current)
+    live_tasks = [task for task in tasks if not task.done()]
+    for task in live_tasks:
+        task.cancel()
+    if live_tasks:
+        await asyncio.gather(*live_tasks, return_exceptions=True)
+    app.bot_data["_bg_tasks"] = set()
+    app.bot_data["resume_task"] = None
+
+    batcher: InboundBatcher | None = app.bot_data.get("inbound_batcher")
+    if batcher is not None:
+        await batcher.stop()
+
+
+async def _post_shutdown(app: Application) -> None:
+    await _stop_health_probe(app)
+    await _cancel_app_background_tasks(app)
     web = app.bot_data.get("web_console")
     if web is not None:
         web.stop()
@@ -2952,25 +2984,16 @@ def _start_health_probe(
     is_primary = app.bot_data.get("is_primary_bot", True)
     bot_name = bot_cfg.name if bot_cfg else "default"
 
-    async def _notify(text: str) -> None:
-        allowed = (bot_cfg.allowed_user_id if bot_cfg else None) or cfg.allowed_user_id
-        if not allowed:
-            return
-        try:
-            await app.bot.send_message(int(allowed), text, parse_mode=ParseMode.HTML)
-        except Exception:  # noqa: BLE001
-            logger.warning("Health probe Telegram notify failed", exc_info=True)
-
-    async def _soft() -> None:
+    async def _soft() -> bool:
         """Per-bot in-process updater restart; other bots stay untouched."""
         ok = await _restart_updater(app)
         if not ok:
             logger.error("Health probe: updater restart failed  bot=%s", bot_name)
+        return ok
 
     async def _kick() -> None:
-        chat = (bot_cfg.allowed_user_id if bot_cfg else None) or cfg.allowed_user_id
-        if chat:
-            _save_restart_notify(cfg, int(chat), mode="reload", bot=bot_name)
+        # Health incidents are log-only. Manual /restart and /reload retain
+        # their Telegram acknowledgements through their own command paths.
         await _kickstart_after_reply(cfg)
 
     async def _heartbeat() -> None:
@@ -2990,7 +3013,7 @@ def _start_health_probe(
         # escalate to process-level launchd kickstart.
         soft_restart_cb=_soft,
         kickstart_cb=_kick if is_primary else None,
-        notify_cb=_notify,
+        notify_cb=None,
         is_updater_running=_updater_ok,
         heartbeat_cb=_heartbeat,
     )
@@ -3010,7 +3033,6 @@ def _start_health_probe(
 
 async def _on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     err = context.error
-    probe: HealthProbe | None = context.application.bot_data.get("health_probe")
     if isinstance(err, Conflict):
         _log_action("Telegram poll conflict — scheduling restart")
         cfg = context.application.bot_data.get("cfg")
@@ -3019,17 +3041,14 @@ async def _on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
         else:
             global _pending_restart
             _pending_restart = True
-        if probe is not None:
-            probe.note_poll_error(err)
         return
     if isinstance(err, (NetworkError, RetryAfter)) or should_count_as_poll_error(err):
-        logger.warning("Telegram network event: %s", err)
-        if probe is not None:
-            probe.note_poll_error(err)
+        # Handler/send failures are not getUpdates failures. The polling
+        # callback records poll health directly so unrelated Bot API traffic
+        # cannot poison the poller recovery counter.
+        logger.warning("Telegram handler network event: %s", err)
         return
     logger.error("Unhandled error: %s", err, exc_info=err)
-    if probe is not None and should_count_as_poll_error(err):
-        probe.note_poll_error(err)
 
 
 def _proxy_url_from_env() -> str | None:
@@ -3048,25 +3067,29 @@ def _proxy_url_from_env() -> str | None:
 def _make_poll_error_callback(app: Application):
     """Return PTB ``start_polling`` ``error_callback`` for one bot app.
 
-    PTB only routes polling failures into the app's error handlers when using
-    ``Application.run_polling``; this project drives ``Updater.start_polling``
-    directly, so without an explicit callback every poll error fell back to
-    PTB's ``default_error_callback`` (90-line traceback, no health accounting).
-
-    The callback must be a plain (non-coroutine) function and must never raise,
-    or PTB aborts the poll retry loop. We schedule the app's own error
-    processing instead so ``_on_error`` keeps single-line logging and probe
-    bookkeeping in one place.
+    This is the only source allowed to increment poll-failure state. Application
+    error handlers also see outbound send/edit errors, which must not trigger a
+    getUpdates restart.
     """
 
     def error_callback(exc: BaseException) -> None:
         try:
-            app.create_task(
-                app.process_error(error=exc, update=None),
-                name="poll-error-handler",
-            )
+            logger.warning("Telegram poll event: %s", exc)
+            if isinstance(exc, Conflict):
+                _log_action("Telegram poll conflict — scheduling restart")
+                cfg = app.bot_data.get("cfg")
+                if cfg is not None:
+                    _request_restart(cfg)
+                else:
+                    global _pending_restart
+                    _pending_restart = True
+                return
+            if isinstance(exc, (NetworkError, RetryAfter)) or should_count_as_poll_error(exc):
+                probe: HealthProbe | None = app.bot_data.get("health_probe")
+                if probe is not None:
+                    probe.note_poll_error(exc)
         except Exception:  # noqa: BLE001 - must never raise into the poll loop
-            logger.exception("Poll error callback failed to schedule handler")
+            logger.exception("Poll error callback failed")
 
     return error_callback
 
@@ -3187,34 +3210,58 @@ def _build_app(cfg: Config, bot_cfg: BotConfig | None = None) -> Application:
 
 
 async def _async_run_apps(cfg: Config, apps: list[Application], drop_pending: bool) -> None:
-    for app in apps:
-        await app.initialize()
-        # PTB only runs post_init inside run_polling/run_webhook — we must call it ourselves.
-        if app.post_init:
-            await app.post_init(app)
-        await app.start()
-        if app.updater:
-            await app.updater.start_polling(
-                allowed_updates=Update.ALL_TYPES,
-                drop_pending_updates=drop_pending,
-                error_callback=_make_poll_error_callback(app),
-            )
-        await _send_restart_notify(app)
+    initialized: list[Application] = []
+    try:
+        for app in apps:
+            await app.initialize()
+            initialized.append(app)
+            # PTB only runs post_init inside run_polling/run_webhook — we must call it ourselves.
+            if app.post_init:
+                await app.post_init(app)
+            await app.start()
+            if app.updater:
+                await app.updater.start_polling(
+                    allowed_updates=Update.ALL_TYPES,
+                    drop_pending_updates=drop_pending,
+                    error_callback=_make_poll_error_callback(app),
+                )
+            # The probe must not observe updater_dead during startup.
+            _start_health_probe(app, cfg, app.bot_data.get("bot_cfg"))
+            await _send_restart_notify(app)
 
-    while not _restart_wanted(cfg):
-        await asyncio.sleep(0.5)
-
-    for app in reversed(apps):
-        try:
-            if app.updater and app.updater.running:
-                await app.updater.stop()
-            if app.running:
-                await app.stop()
-            if app.post_shutdown:
-                await app.post_shutdown(app)
-            await app.shutdown()
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("Error stopping app: %s", exc)
+        while not _restart_wanted(cfg):
+            await asyncio.sleep(0.5)
+    finally:
+        for app in reversed(initialized):
+            # Stop the probe before intentionally stopping the updater, or it
+            # can race shutdown and relaunch polling.
+            try:
+                await _stop_health_probe(app)
+            except Exception:  # noqa: BLE001
+                logger.warning("Error stopping health probe", exc_info=True)
+            try:
+                await _cancel_app_background_tasks(app)
+            except Exception:  # noqa: BLE001
+                logger.warning("Error cancelling app tasks", exc_info=True)
+            try:
+                if app.updater and app.updater.running:
+                    await app.updater.stop()
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Error stopping updater: %s", exc)
+            try:
+                if app.running:
+                    await app.stop()
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Error stopping application: %s", exc)
+            try:
+                if app.post_shutdown:
+                    await app.post_shutdown(app)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Error in post_shutdown: %s", exc)
+            try:
+                await app.shutdown()
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Error shutting down app: %s", exc)
 
 
 def _run_once(cfg: Config) -> bool:

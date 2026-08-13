@@ -17,7 +17,7 @@ from typing import Awaitable, Callable, Optional
 logger = logging.getLogger("cursor_bridge.health")
 
 KickstartCb = Callable[[], Awaitable[None]]
-SoftRestartCb = Callable[[], None]
+SoftRestartCb = Callable[[], bool | Awaitable[bool]]
 NotifyCb = Callable[[str], Awaitable[None]]
 
 
@@ -28,6 +28,8 @@ class HealthState:
     last_ok_at: float = field(default_factory=time.time)
     last_poll_error_at: float = 0.0
     consecutive_poll_failures: int = 0
+    heartbeat_failures: int = 0
+    last_heartbeat_error_at: float = 0.0
     soft_restarts: int = 0
     last_recovery_at: float = 0.0
     updater_alive: bool = True
@@ -74,14 +76,26 @@ class HealthProbe:
         self._stop = asyncio.Event()
 
     def note_ok(self) -> None:
+        """Record positive getUpdates evidence from an authorized update."""
         self.state.last_ok_at = time.time()
         self.state.consecutive_poll_failures = 0
+        self.state.last_poll_error_at = 0.0
         self.state.updater_alive = True
-        # Do not clear soft_restarts here — owner messages call note_ok on every
-        # update and would prevent kickstart escalation after soft restarts.
+        self.state.soft_restarts = 0
+        self.state.episode_open = False
 
     def note_poll_error(self, err: BaseException | None = None) -> None:
-        self.state.last_poll_error_at = time.time()
+        """Record one getUpdates failure.
+
+        Errors separated by a healthy-sized gap are different bursts. This
+        prevents eight sporadic network failures over an idle afternoon from
+        being misclassified as eight consecutive polling failures.
+        """
+        now = time.time()
+        previous = self.state.last_poll_error_at
+        if previous and now - previous >= self.quiet_sec:
+            self.state.consecutive_poll_failures = 0
+        self.state.last_poll_error_at = now
         self.state.consecutive_poll_failures += 1
         if err is not None:
             logger.warning(
@@ -138,10 +152,15 @@ class HealthProbe:
     async def _heartbeat_tick(self) -> None:
         try:
             await self.heartbeat_cb()
+            self.state.heartbeat_failures = 0
+            self.state.last_heartbeat_error_at = 0.0
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # noqa: BLE001
-            self.note_poll_error(exc)
+            # getMe uses the normal Bot API pool, not the separate getUpdates
+            # pool. It is useful reachability telemetry, but not poll evidence.
+            self.state.heartbeat_failures += 1
+            self.state.last_heartbeat_error_at = time.time()
             logger.warning("Telegram heartbeat failed: %s", exc)
 
     async def _loop(self) -> None:
@@ -160,9 +179,6 @@ class HealthProbe:
 
     async def _tick(self) -> None:
         now = time.time()
-        # Cooldown after a recovery attempt so we don't thrash.
-        if now - self.state.last_recovery_at < 90.0:
-            return
 
         updater_dead = False
         if self.is_updater_running is not None:
@@ -173,40 +189,66 @@ class HealthProbe:
             self.state.updater_alive = not updater_dead
 
         failures = self.state.consecutive_poll_failures
-        quiet = now - self.state.last_ok_at
-        wedged = updater_dead or (
-            failures >= self.poll_fail_threshold
-            and quiet >= self.quiet_sec
+        error_age = (
+            now - self.state.last_poll_error_at
+            if self.state.last_poll_error_at
+            else float("inf")
         )
-        if not wedged:
-            # Sustained health after the last recovery — reset escalation counter.
-            # Require updater alive, no poll failures, and past recovery cooldown
-            # so a soft-restart notify + owner reply cannot wipe the counter.
-            healthy_for = now - self.state.last_recovery_at
-            if (
-                self.state.soft_restarts
-                and not updater_dead
-                and failures == 0
-                and self.state.last_recovery_at > 0
-                and healthy_for >= max(300.0, self.quiet_sec)
-            ):
-                logger.info(
-                    "Health probe: sustained healthy for %.0fs — resetting soft_restarts",
-                    healthy_for,
+
+        # No new polling error for a full quiet window: the burst recovered.
+        if not updater_dead and failures and error_age >= self.quiet_sec:
+            logger.info(
+                "Health probe: poll error burst recovered after %.0fs "
+                "(failures=%s)",
+                error_age,
+                failures,
+            )
+            if self.state.episode_open:
+                await self._notify(
+                    "✅ Health probe: Telegram poll recovered — "
+                    f"episode closed after {self.state.soft_restarts} "
+                    "soft restart(s)."
                 )
-                if self.state.episode_open:
-                    await self._notify(
-                        "✅ Health probe: Telegram poll recovered — "
-                        f"episode closed after {self.state.soft_restarts} "
-                        "soft restart(s)."
-                    )
-                self.state.soft_restarts = 0
-                self.state.episode_open = False
+            self.state.consecutive_poll_failures = 0
+            self.state.last_poll_error_at = 0.0
+            self.state.soft_restarts = 0
+            self.state.episode_open = False
+            return
+
+        # A successful restart with no new errors closes after one quiet
+        # probation window. Until then, retain the escalation count.
+        if (
+            not updater_dead
+            and failures == 0
+            and self.state.episode_open
+            and self.state.last_recovery_at > 0
+            and now - self.state.last_recovery_at >= self.quiet_sec
+        ):
+            logger.info(
+                "Health probe: poller healthy for %.0fs after restart",
+                now - self.state.last_recovery_at,
+            )
+            await self._notify(
+                "✅ Health probe: Telegram poll recovered — "
+                f"episode closed after {self.state.soft_restarts} "
+                "soft restart(s)."
+            )
+            self.state.soft_restarts = 0
+            self.state.episode_open = False
+            return
+
+        # Cooldown after a recovery attempt so we don't thrash.
+        if now - self.state.last_recovery_at < 90.0:
+            return
+
+        wedged = updater_dead or failures >= self.poll_fail_threshold
+        if not wedged:
             return
 
         reason = (
             f"updater_dead={updater_dead} poll_failures={failures} "
-            f"quiet={quiet:.0f}s"
+            f"last_poll_error={error_age:.0f}s ago "
+            f"heartbeat_failures={self.state.heartbeat_failures}"
         )
         logger.error("Health probe: Telegram bridge appears wedged (%s)", reason)
 
@@ -216,6 +258,12 @@ class HealthProbe:
             and self.state.soft_restarts >= self.kickstart_after_soft
             and self.kickstart_cb is not None
         ):
+            logger.error(
+                "Health probe: escalating to launchd kickstart after %s "
+                "soft restart(s) (%s)",
+                self.state.soft_restarts,
+                reason,
+            )
             msg = (
                 "🩺 Health probe: soft restart failed repeatedly — "
                 "launchd kickstart to recover."
@@ -247,7 +295,20 @@ class HealthProbe:
                 )
             result = self.soft_restart_cb()
             if inspect.isawaitable(result):
-                await result
+                result = await result
+            restart_ok = result is not False
+            if restart_ok:
+                # A successful in-process restart is a new polling baseline.
+                # Require fresh post-restart errors before another recovery.
+                self.state.consecutive_poll_failures = 0
+                self.state.last_poll_error_at = 0.0
+                self.state.updater_alive = True
+                logger.warning(
+                    "Health probe: poller restart succeeded; awaiting fresh "
+                    "poll evidence"
+                )
+            else:
+                logger.error("Health probe: poller restart failed (%s)", reason)
             return
 
         logger.error("Health probe: no recovery callback configured")

@@ -281,6 +281,16 @@ class InboundBatcher:
     def pending_count(self, chat_id: int, sid: str) -> int:
         return len(self._pending.get((chat_id, sid), ()))
 
+    async def stop(self) -> None:
+        """Cancel pending debounce tasks during application shutdown."""
+        tasks = list(self._tasks.values())
+        self._tasks.clear()
+        self._pending.clear()
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+
     async def add(
         self,
         chat_id: int,

@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 from urllib.parse import parse_qs, urlparse
 
-from .context import format_context_line, get_context_info
+from .context import format_context_line, get_context_info, resolve_context_window
 from .events import SessionEventLog
 from .state_layout import bot_state_dir, migrate_legacy_default_state
 
@@ -378,7 +378,13 @@ class _ConsoleHandler(BaseHTTPRequestHandler):
             rows = []
             for s in sessions:
                 sid = str(s.get("short_id", "?"))
-                ctx = get_context_info(s.get("agent_id"), s.get("cwd", ""))
+                window = resolve_context_window(
+                    str(s.get("model") or ""),
+                    cfg.model_context_windows,
+                )
+                ctx = get_context_info(
+                    s.get("agent_id"), s.get("cwd", ""), window=window,
+                )
                 cwd = s.get("cwd", "")
                 name = s.get("custom_name") or Path(cwd).name or sid
                 rows.append({

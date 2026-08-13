@@ -34,8 +34,10 @@ echo ""
 # Keep this window alive across /restart — Python sets state/restart_requested
 # when a restart is needed; if the process exits before coming back, we relaunch.
 while true; do
-    "$DIR/.venv/bin/python" -m cursor_bridge
-    EXIT=$?
+    # Keep set -e from terminating this wrapper before we can inspect the
+    # restart flag after an abnormal Python exit.
+    EXIT=0
+    "$DIR/.venv/bin/python" -m cursor_bridge || EXIT=$?
     if [ ! -f "$DIR/state/restart_requested" ]; then
         exit "$EXIT"
     fi

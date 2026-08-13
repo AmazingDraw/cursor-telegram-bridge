@@ -11,6 +11,28 @@ PRIOR_CONTEXT_MAX_CHARS = 80_000
 _USER_QUERY_RE = re.compile(r"<user_query>\s*(.*?)\s*</user_query>", re.DOTALL)
 
 
+def resolve_context_window(model_id: str, table: dict[str, int]) -> int:
+    """Pick a display-only context window for Bridge UI estimates.
+
+    Resolution order:
+    1. Exact match on ``table[model_id.lower()]``
+    2. Series/substring match: if ``model_id`` contains a table key (longer keys first)
+    3. ``DEFAULT_CONTEXT_WINDOW``
+
+    Does not change Cursor's real truncation behavior.
+    """
+    key = (model_id or "").strip().lower()
+    if not key:
+        return DEFAULT_CONTEXT_WINDOW
+    if key in table:
+        return int(table[key])
+    # Longer keys first so e.g. "kimi-k3" wins over a hypothetical "kimi".
+    for series in sorted(table.keys(), key=len, reverse=True):
+        if series and series in key:
+            return int(table[series])
+    return DEFAULT_CONTEXT_WINDOW
+
+
 @dataclass(frozen=True)
 class ContextInfo:
     tokens: int

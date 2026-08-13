@@ -81,13 +81,15 @@ class Config:
     health_check_interval_sec: float = 60.0
     # Consecutive poll failures before soft restart is considered.
     health_poll_fail_threshold: int = 8
-    # Quiet period (no successful Telegram traffic) required with failures.
+    # Gap that splits poll-error bursts and confirms post-restart recovery.
     health_quiet_sec: float = 180.0
-    # Per-bot getMe heartbeat interval. Failure counts as a poll error; success
-    # does not clear poll failures (getMe can work while long-polling is wedged).
+    # Per-bot getMe reachability telemetry; kept separate from getUpdates health.
     health_heartbeat_interval_sec: float = 30.0
     # Soft restarts before escalating to launchd kickstart (0 = never kickstart).
     health_kickstart_after_soft: int = 2
+    # Display-only context window denominators keyed by model id / series
+    # (see resolve_context_window). Does not change Cursor truncation.
+    model_context_windows: dict[str, int] = field(default_factory=dict)
 
     @property
     def sessions_file(self) -> Path:
@@ -174,6 +176,9 @@ def load_config(project_root: Path) -> Config:
     )
     health_kickstart_after_soft = _nonneg_int(
         data.get("health_kickstart_after_soft"), default=2,
+    )
+    model_context_windows = _parse_model_context_windows(
+        data.get("model_context_windows"),
     )
     bookmarks = [
         Bookmark(name=str(b["name"]), path=str(_expand(b["path"], base=project_root)))
@@ -271,6 +276,7 @@ def load_config(project_root: Path) -> Config:
         health_quiet_sec=health_quiet_sec,
         health_heartbeat_interval_sec=health_heartbeat_interval_sec,
         health_kickstart_after_soft=health_kickstart_after_soft,
+        model_context_windows=model_context_windows,
     )
 
 
@@ -372,6 +378,25 @@ def _parse_setting_sources(raw: object) -> list[str]:
             continue
         if val not in out:
             out.append(val)
+    return out
+
+
+def _parse_model_context_windows(raw: object) -> dict[str, int]:
+    """Parse ``[model_context_windows]`` — display-only denominators for UI."""
+    if not isinstance(raw, dict):
+        return {}
+    out: dict[str, int] = {}
+    for key, value in raw.items():
+        name = str(key).strip().lower()
+        if not name:
+            continue
+        try:
+            window = int(value)
+        except (TypeError, ValueError):
+            continue
+        if window <= 0:
+            continue
+        out[name] = window
     return out
 
 
