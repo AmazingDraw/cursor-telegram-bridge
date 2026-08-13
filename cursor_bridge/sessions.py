@@ -142,6 +142,9 @@ class Session:
     run_id: Optional[str] = None
     prior_agent_ids: list[str] = field(default_factory=list)
     context_restored_from: Optional[str] = None
+    # Set when a recreate dropped prior context but no completed run has
+    # surfaced the /context hint yet (e.g. the run was cancelled mid-way).
+    context_lost_notice_pending: bool = False
     custom_name: Optional[str] = None
     # Runtime-only handles (never persisted).
     agent: object = field(default=None, repr=False)
@@ -167,6 +170,7 @@ class Session:
             "last_activity": self.last_activity,
             "prior_agent_ids": list(self.prior_agent_ids),
             "context_restored_from": self.context_restored_from,
+            "context_lost_notice_pending": self.context_lost_notice_pending,
         }
 
 
@@ -486,6 +490,10 @@ class SessionManager:
         s.agent = agent
         if old_agent_id and old_agent_id not in s.prior_agent_ids:
             s.prior_agent_ids.append(old_agent_id)
+        if old_agent_id:
+            # Context is objectively lost from this moment — mark it so the
+            # /context hint survives cancels/retries until a run surfaces it.
+            s.context_lost_notice_pending = True
         s.agent_id = getattr(agent, "agent_id", None)
         s.status = STATUS_IDLE
         s.run = None
@@ -835,6 +843,31 @@ class SessionManager:
             is not None
         )
 
+    def _context_lost_note(self, s: Session, recreated: bool) -> str:
+        """/context hint to prepend when this run lost prior context ("" if none).
+
+        Sticky: a recreate marks ``context_lost_notice_pending`` at the moment
+        context is dropped, so the hint still surfaces on the next completed
+        run even when the recreating run was cancelled or retried. The flag is
+        cleared (and persisted) once the note is actually emitted here.
+        """
+        if not (recreated or s.context_lost_notice_pending):
+            return ""
+        if self.can_restore_context(s):
+            note = (
+                "(Session was reset after a stuck agent — prior chat context was lost. "
+                "Send /context to restore it for this session only.)\n\n"
+            )
+        else:
+            note = (
+                "(Session was reset after a stuck agent — prior chat context was lost. "
+                "No recoverable transcript found; please restate your task.)\n\n"
+            )
+        if s.context_lost_notice_pending:
+            s.context_lost_notice_pending = False
+            self._persist()
+        return note
+
     def prepare_context_restore(
         self,
         s: Session,
@@ -905,6 +938,10 @@ class SessionManager:
             f"Prepared prior context from `{chosen}` "
             f"({condensed.user_turns} user turns, ~{condensed.chars // 4} tokens)."
         )
+        if s.context_lost_notice_pending:
+            # Restore supersedes the pending loss hint.
+            s.context_lost_notice_pending = False
+            self._persist()
         return build_context_restore_prompt(s.short_id, s.cwd), summary, chosen
 
     # ---- running prompts ---------------------------------------------------
@@ -1691,17 +1728,8 @@ class SessionManager:
 
         self._persist()
         logger.info("Session %s run finished: %s", s.short_id, rstatus)
-        if recreated:
-            if self.can_restore_context(s):
-                note = (
-                    "(Session was reset after a stuck agent — prior chat context was lost. "
-                    "Send /context to restore it for this session only.)\n\n"
-                )
-            else:
-                note = (
-                    "(Session was reset after a stuck agent — prior chat context was lost. "
-                    "No recoverable transcript found; please restate your task.)\n\n"
-                )
+        note = self._context_lost_note(s, recreated)
+        if note:
             final = note + (final or "")
         attachments = collect_run_attachments(
             cwd=s.cwd,
@@ -1804,5 +1832,8 @@ class SessionManager:
                 last_activity=sd.get("last_activity", time.time()),
                 prior_agent_ids=list(sd.get("prior_agent_ids") or []),
                 context_restored_from=sd.get("context_restored_from"),
+                context_lost_notice_pending=bool(
+                    sd.get("context_lost_notice_pending")
+                ),
             )
             self.sessions[s.short_id] = s
