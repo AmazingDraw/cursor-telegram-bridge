@@ -97,6 +97,11 @@ MAX_PROMPT_QUEUE = 20
 
 # How many times to try a prompt when the Cursor bridge dies (send or mid-stream).
 BRIDGE_RUN_ATTEMPTS = 3
+# Same-agent retries for "agent busy" before recreate (delays sum to <=15s).
+AGENT_BUSY_MAX_RETRIES = 2
+AGENT_BUSY_BACKOFF_SEC = (5.0, 10.0)
+# Empty error with no output: treat as instant glitch within this window.
+INSTANT_EMPTY_ERROR_SEC = 10.0
 
 # After hung-run watchdog abort: auto-send this once (same as user typing 继续).
 STALL_AUTO_CONTINUE_PROMPT = "继续"
@@ -256,17 +261,45 @@ def _is_bridge_down(exc: BaseException) -> bool:
     )
 
 
-def _is_stuck_agent(exc: BaseException) -> bool:
-    """True when resume/send failed because the agent handle is corrupted or busy."""
-    if isinstance(exc, (InternalServerError, AgentBusyError)):
+def _is_agent_busy(exc: BaseException) -> bool:
+    """True when the SDK agent is temporarily busy (same-agent retry is useful)."""
+    if isinstance(exc, AgentBusyError):
+        return True
+    text = str(exc).lower()
+    return "agent busy" in text or "agent_busy" in text
+
+
+def _is_internal_server_error(exc: BaseException) -> bool:
+    """True for SDK internal errors — recreate rather than wait on the same agent."""
+    if isinstance(exc, InternalServerError):
         return True
     text = str(exc).lower()
     # Avoid bare "internal" — matches unrelated errors (e.g. "internal timeout").
+    return "internal server error" in text or "internal error" in text
+
+
+def _is_stuck_agent(exc: BaseException) -> bool:
+    """True when resume/send failed because the agent handle is corrupted or busy."""
+    return _is_agent_busy(exc) or _is_internal_server_error(exc)
+
+
+def _is_instant_empty_error(
+    *,
+    stalled: bool,
+    rstatus: str,
+    final: str,
+    text_parts: list[str],
+    tool_hits: int,
+    elapsed_sec: float,
+    window_sec: float = INSTANT_EMPTY_ERROR_SEC,
+) -> bool:
     return (
-        "internal server error" in text
-        or "internal error" in text
-        or "agent busy" in text
-        or "agent_busy" in text
+        not stalled
+        and rstatus == "error"
+        and not (final or "").strip()
+        and not text_parts
+        and not tool_hits
+        and elapsed_sec < window_sec
     )
 
 
@@ -1299,20 +1332,36 @@ class SessionManager:
         send_opts = SendOptions(model=self.model_for_sdk(s), mode=s.mode)  # type: ignore[arg-type]
         run = None
         recreated = _recreated
-        # Retry with recovery: dead bridge -> rebuild+recreate; stuck agent -> recreate.
-        for attempt in range(1, BRIDGE_RUN_ATTEMPTS + 1):
+        # Retry: busy -> same agent; dead bridge / ISE -> recover or recreate.
+        attempt = 1
+        busy_retries = 0
+        while attempt <= BRIDGE_RUN_ATTEMPTS:
             try:
                 if await self._ensure_agent(s):
                     recreated = True
                 run = await s.agent.send(prompt, send_opts)  # type: ignore[attr-defined]
                 break
             except Exception as exc:  # noqa: BLE001
+                if _is_agent_busy(exc) and busy_retries < AGENT_BUSY_MAX_RETRIES:
+                    delay = AGENT_BUSY_BACKOFF_SEC[busy_retries]
+                    busy_retries += 1
+                    logger.warning(
+                        "Agent busy for session %s (%s); same-agent retry %s/%s in %.0fs",
+                        s.short_id,
+                        exc,
+                        busy_retries,
+                        AGENT_BUSY_MAX_RETRIES,
+                        delay,
+                    )
+                    await asyncio.sleep(delay)
+                    continue
                 if attempt >= BRIDGE_RUN_ATTEMPTS:
                     raise
                 if _is_bridge_down(exc):
                     outcome = await self._recover_bridge_session(s, exc)
                     if outcome == "recreated":
                         recreated = True
+                    attempt += 1
                     continue
                 if _is_stuck_agent(exc):
                     logger.warning(
@@ -1323,6 +1372,7 @@ class SessionManager:
                     async with self._agent_lock(s.short_id):
                         await self._recreate_agent(s)
                     recreated = True
+                    attempt += 1
                     continue
                 raise
         assert run is not None
@@ -1849,20 +1899,29 @@ class SessionManager:
                 (final or "")[:300],
             )
 
-        instant_empty_error = (
-            not stalled
-            and rstatus == "error"
-            and not (final or "").strip()
-            and not text_parts
-            and not tool_hits
-            and (time.time() - run_started_at) < 8
+        instant_empty_error = _is_instant_empty_error(
+            stalled=stalled,
+            rstatus=rstatus,
+            final=final or "",
+            text_parts=text_parts,
+            tool_hits=tool_hits,
+            elapsed_sec=time.time() - run_started_at,
         )
         if instant_empty_error:
+            same_agent = _depth == 0
             logger.warning(
-                "Session %s instant empty error (model=%s mode=%s) — recreating and auto-retrying",
+                "Session %s instant empty error (model=%s mode=%s) — %s",
                 s.short_id,
                 s.model,
                 s.mode,
+                "same-agent retry" if same_agent else "recreating and auto-retrying",
+            )
+            activity = (
+                "\u26a0\ufe0f instant empty error — retrying same agent\u2026"
+                if same_agent
+                else (
+                    "\u26a0\ufe0f instant empty error — recreating agent and retrying\u2026"
+                )
             )
             try:
                 await on_update(
@@ -1870,9 +1929,7 @@ class SessionManager:
                         s,
                         text_parts,
                         {
-                            "activity": (
-                                "\u26a0\ufe0f instant empty error — recreating agent and retrying\u2026"
-                            ),
+                            "activity": activity,
                             "snippet": "",
                             "elapsed": live.get("elapsed"),
                         },
@@ -1882,6 +1939,15 @@ class SessionManager:
             except Exception:  # noqa: BLE001
                 logger.warning(
                     "instant-empty notify failed for %s", s.short_id, exc_info=True,
+                )
+            if same_agent:
+                return await self._run_prompt_inner(
+                    s,
+                    prompt,
+                    on_update,
+                    on_attachment,
+                    _depth=1,
+                    _stall_retries=_stall_retries,
                 )
             try:
                 async with self._agent_lock(s.short_id):
@@ -1899,17 +1965,15 @@ class SessionManager:
                 rstatus = STATUS_GLITCH
                 s.status = STATUS_IDLE
             else:
-                if _depth == 0:
-                    # Auto-retry the prompt with the fresh agent (once only).
+                if _depth == 1:
                     return await self._run_prompt_inner(
                         s,
                         prompt,
                         on_update,
                         on_attachment,
-                        _depth=1,
+                        _depth=2,
                         _stall_retries=_stall_retries,
                     )
-                # Second glitch in a row — give up and tell the user.
                 final = instant_empty_user_message(s.model, s.mode)
                 rstatus = STATUS_GLITCH
                 s.status = STATUS_IDLE
