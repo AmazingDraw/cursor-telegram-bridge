@@ -35,7 +35,7 @@ def model_set_notice(model: str) -> str:
 
 
 def instant_empty_user_message(model: str, mode: str) -> str:
-    """Shown after same-agent + recreate retries still return a fast empty error."""
+    """Plain-text body shown after same-agent retry + one recreate still empty."""
     lines = [
         f"**{model or 'unknown'}** failed with no output.",
         "Session was reset — send your prompt again.",

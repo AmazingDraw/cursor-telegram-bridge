@@ -66,7 +66,7 @@ class Config:
     # After a mid-stream bridge crash, try to resume the same agent on the new
     # bridge (keeps conversation context). Disable if resume reliably errors.
     try_resume_first: bool = True
-    # Markdown/text injected into every Telegram prompt (bridge-owned rules).
+    # Markdown/text injected on /new, resume, recreate, and after compact.
     rules_text: str = ""
     rules_file: Path | None = None
     # Abort a run when no assistant/tool progress for this many seconds.

@@ -5,8 +5,8 @@ Used by sessions.py (live stream) and bot.py (final reply).
 Live message layout (HTML, edited in place):
   1. Blockquote header: [sid] folder-name · model
   2. Assistant text preview (truncated)
-  3. Activity line: tool-specific with status emoji (🟡 running, ✅ done, ❌ failed)
-  4. Optional <pre> snippet: red/green diff lines (🔴/🟢), grep hits, shell output
+  3. Activity line: tool-specific with status emoji (🧰 running, ✅ done)
+  4. Optional <pre> snippet: diff lines (+/-), grep hits, shell output
   5. Elapsed timer (⏳/⌛ Ns) in the header bar, flipping every 5s
 
 Final message: same header + status icon + markdown_to_telegram_html(body).
@@ -28,6 +28,10 @@ _SNIPPET_MAX_LINE_CHARS = 120
 _INLINE_CODE_MAX_CHARS = 160
 LIVE_TIMER_INTERVAL_SEC = 3
 _TIMER_ICONS = ("⏳", "⌛")
+THINKING_ACTIVITY = "\U0001F914 thinking\u2026"
+STARTING_ACTIVITY = "\U0001F468\U0001F3FB\u200D\U0001F4BB starting\u2026"
+TOOL_RUNNING_MARK = "\U0001F9F0"  # 🧰
+TOOL_DONE_MARK = "\u2705"
 
 _PLACEHOLDER_CODEBLOCK = "\x00CB"
 _PLACEHOLDER_INLINE = "\x00IC"
@@ -258,10 +262,10 @@ def _format_activity_line(activity: str) -> str:
 
 
 def format_tool_activity(name: str, args: Any, *, done: bool = False) -> str:
-    """One-line description of what a tool is doing (🟡) or just did (✅)."""
+    """One-line description of what a tool is doing (🧰) or just did (✅)."""
     tool = _normalize_tool(name)
     data = parse_tool_args(args)
-    mark = "✅" if done else "🟡"
+    mark = TOOL_DONE_MARK if done else TOOL_RUNNING_MARK
 
     if tool in ("read", "readfile"):
         path = _tool_path(data)
@@ -468,18 +472,8 @@ def _is_unified_diff(text: str) -> bool:
 
 
 def colorize_diff_lines(text: str, *, max_lines: int = _SNIPPET_MAX_LINES) -> str:
-    """Prefix unified-diff lines with red/green emoji markers."""
-    out: list[str] = []
-    for line in text.splitlines():
-        if line.startswith("+++") or line.startswith("---") or line.startswith("@@"):
-            out.append(f"🔷 {line}")
-        elif line.startswith("+"):
-            out.append(f"🟢 {line}")
-        elif line.startswith("-"):
-            out.append(f"🔴 {line}")
-        else:
-            out.append(f"   {line}")
-    return "\n".join(_limit_lines(out, max_lines))
+    """Keep unified-diff +/- markers; no colored-circle prefixes."""
+    return "\n".join(_limit_lines(text.splitlines(), max_lines))
 
 
 def colorize_grep_lines(text: str, *, max_lines: int = _SNIPPET_MAX_LINES) -> str:
@@ -488,7 +482,7 @@ def colorize_grep_lines(text: str, *, max_lines: int = _SNIPPET_MAX_LINES) -> st
 
 
 def _edit_snippet_from_args(args: Any, *, max_lines: int = _SNIPPET_MAX_LINES) -> str:
-    """Red/green mini-diff from StrReplace/Edit tool args."""
+    """Mini-diff from StrReplace/Edit tool args (+/- only)."""
     data = parse_tool_args(args)
     old = _arg_text(data, "old_string", "old_str", "oldText", "old_text")
     new = _arg_text(data, "new_string", "new_str", "newText", "new_text")
@@ -497,19 +491,19 @@ def _edit_snippet_from_args(args: Any, *, max_lines: int = _SNIPPET_MAX_LINES) -
 
     out: list[str] = []
     for line in old.splitlines() or [old]:
-        out.append(f"🔴 -{line}")
+        out.append(f"-{line}")
     for line in new.splitlines() or [new]:
-        out.append(f"🟢 +{line}")
+        out.append(f"+{line}")
     return "\n".join(_limit_lines(out, max_lines))
 
 
 def _write_snippet_from_args(args: Any, *, max_lines: int = _SNIPPET_MAX_LINES) -> str:
-    """Green lines for new file content from Write tool args."""
+    """Added lines from Write tool args."""
     data = parse_tool_args(args)
     content = _arg_text(data, "content", "contents", "text", "body", "code")
     if not content:
         return ""
-    out = [f"🟢 +{line}" for line in content.splitlines()]
+    out = [f"+{line}" for line in content.splitlines()]
     return "\n".join(_limit_lines(out, max_lines))
 
 
@@ -1042,7 +1036,7 @@ def chunk_telegram_html(text: str, limit: int = TELEGRAM_MESSAGE_LIMIT) -> list[
         if len(remaining) <= limit:
             chunks.append(remaining)
             break
-        window = remaining[:limit]
+        window = remaining[: max(20, limit - 24)]
         split_at = -1
         for marker in ("</pre>", "</blockquote>", "\n\n"):
             pos = window.rfind(marker)
@@ -1052,6 +1046,21 @@ def chunk_telegram_html(text: str, limit: int = TELEGRAM_MESSAGE_LIMIT) -> list[
             split_at = window.rfind("\n")
         if split_at <= 0:
             split_at = limit
-        chunks.append(remaining[:split_at].rstrip())
+        chunk = remaining[:split_at].rstrip()
         remaining = remaining[split_at:].lstrip()
+
+        # Keep code blocks balanced across message chunk boundaries.
+        if chunk.count("<pre>") > chunk.count("</pre>"):
+            has_code = chunk.count("<code>") > chunk.count("</code>")
+            chunk += ("</code></pre>" if has_code else "</pre>")
+            if remaining:
+                remaining = ("<pre><code>" if has_code else "<pre>") + remaining
+
+        # Keep blockquotes balanced across message chunk boundaries.
+        if chunk.count("<blockquote>") > chunk.count("</blockquote>"):
+            chunk += "</blockquote>"
+            if remaining:
+                remaining = "<blockquote>" + remaining
+
+        chunks.append(chunk)
     return chunks

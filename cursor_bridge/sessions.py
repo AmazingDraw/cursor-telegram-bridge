@@ -47,6 +47,9 @@ from .events import SessionEventLog
 from .state_layout import bot_name_for, bot_state_dir, migrate_legacy_default_state
 from .formatting import (
     LIVE_TIMER_INTERVAL_SEC,
+    STARTING_ACTIVITY,
+    THINKING_ACTIVITY,
+    _normalize_sdk_status,
     apply_plan_to_text_parts,
     build_live_html,
     format_sdk_status_activity,
@@ -63,8 +66,8 @@ from .models import (
     format_model_display,
     instant_empty_user_message,
 )
-from .rules import strip_rules_prefix
-from .telegram_delivery import strip_telegram_delivery_prefix
+from .rules import strip_rules_prefix, wrap_with_rules
+from .telegram_delivery import strip_telegram_delivery_prefix, wrap_telegram_prompt
 from .permission_guard import evaluate_tool_call
 
 logger = logging.getLogger("cursor_bridge.sessions")
@@ -97,11 +100,10 @@ MAX_PROMPT_QUEUE = 20
 
 # How many times to try a prompt when the Cursor bridge dies (send or mid-stream).
 BRIDGE_RUN_ATTEMPTS = 3
-# Same-agent retries for "agent busy" before recreate (delays sum to <=15s).
-AGENT_BUSY_MAX_RETRIES = 2
-AGENT_BUSY_BACKOFF_SEC = (5.0, 10.0)
-# Empty error with no output: treat as instant glitch within this window.
-INSTANT_EMPTY_ERROR_SEC = 10.0
+# Same-agent waits before recreating on AgentBusyError (sum well under 15s).
+AGENT_BUSY_BACKOFFS_SEC = (2.0, 4.0)
+# Fast empty SDK error window; beyond this, treat as a normal run error.
+INSTANT_EMPTY_WINDOW_SEC = 10.0
 
 # After hung-run watchdog abort: auto-send this once (same as user typing 继续).
 STALL_AUTO_CONTINUE_PROMPT = "继续"
@@ -174,7 +176,7 @@ class QueuedPrompt:
 
     prompt: str | UserMessage
     chat_id: int
-    thinking_label: str = "\U0001F4AD thinking\u2026"
+    thinking_label: str = THINKING_ACTIVITY
     log_kind: str = "Prompt"
     token: str = field(default_factory=lambda: secrets.token_hex(4))
     # False until the user taps 排队 / 发送 on the ack keyboard — drain must skip.
@@ -199,6 +201,8 @@ class Session:
     # surfaced the /context hint yet (e.g. the run was cancelled mid-way).
     context_lost_notice_pending: bool = False
     custom_name: Optional[str] = None
+    # Next user prompt should prefix rules.md (after /new, resume, recreate, compact).
+    inject_rules_once: bool = True
     # Runtime-only handles (never persisted).
     agent: object = field(default=None, repr=False)
     run: object = field(default=None, repr=False)
@@ -224,6 +228,7 @@ class Session:
             "prior_agent_ids": list(self.prior_agent_ids),
             "context_restored_from": self.context_restored_from,
             "context_lost_notice_pending": self.context_lost_notice_pending,
+            "inject_rules_once": self.inject_rules_once,
         }
 
 
@@ -262,15 +267,20 @@ def _is_bridge_down(exc: BaseException) -> bool:
 
 
 def _is_agent_busy(exc: BaseException) -> bool:
-    """True when the SDK agent is temporarily busy (same-agent retry is useful)."""
+    """True when send failed because the agent is still marked busy."""
     if isinstance(exc, AgentBusyError):
         return True
     text = str(exc).lower()
     return "agent busy" in text or "agent_busy" in text
 
 
-def _is_internal_server_error(exc: BaseException) -> bool:
-    """True for SDK internal errors — recreate rather than wait on the same agent."""
+def _is_stuck_agent(exc: BaseException) -> bool:
+    """True when resume/send failed because the agent handle looks corrupted.
+
+    ``agent busy`` is handled separately (same-agent backoff) and is not stuck.
+    """
+    if _is_agent_busy(exc):
+        return False
     if isinstance(exc, InternalServerError):
         return True
     text = str(exc).lower()
@@ -278,21 +288,17 @@ def _is_internal_server_error(exc: BaseException) -> bool:
     return "internal server error" in text or "internal error" in text
 
 
-def _is_stuck_agent(exc: BaseException) -> bool:
-    """True when resume/send failed because the agent handle is corrupted or busy."""
-    return _is_agent_busy(exc) or _is_internal_server_error(exc)
-
-
-def _is_instant_empty_error(
+def is_instant_empty_error(
     *,
     stalled: bool,
     rstatus: str,
-    final: str,
     text_parts: list[str],
-    tool_hits: int,
+    tool_hits: list[Any],
     elapsed_sec: float,
-    window_sec: float = INSTANT_EMPTY_ERROR_SEC,
+    window_sec: float = INSTANT_EMPTY_WINDOW_SEC,
+    final: str = "",
 ) -> bool:
+    """True when the SDK returned a fast empty error (candidate for retry)."""
     return (
         not stalled
         and rstatus == "error"
@@ -640,6 +646,7 @@ class SessionManager:
         s.agent = agent
         s.agent_id = getattr(agent, "agent_id", None)
         self.sessions[sid] = s
+        s.inject_rules_once = True
         self._persist()
         self.log_session_event(sid, "session_created", cwd=cwd, agent_id=s.agent_id)
         return s
@@ -660,6 +667,8 @@ class SessionManager:
         s.agent = agent
         if s.status == STATUS_RUNNING:
             s.status = STATUS_IDLE
+        s.inject_rules_once = True
+        self._persist()
         logger.info("Resumed session %s (agent %s)", s.short_id, s.agent_id)
 
     async def _ensure_agent(self, s: Session) -> bool:
@@ -701,6 +710,7 @@ class SessionManager:
         s.run = None
         s.run_id = None
         s.context_restored_from = None
+        s.inject_rules_once = True
         self._persist()
         self.log_session_event(
             s.short_id,
@@ -921,9 +931,7 @@ class SessionManager:
         all_ids = [m.id for m in models]
         allowed = self.allowed_models or self.cfg.models
         if allowed:
-            allowed_set = {m_id.lower() for m_id in allowed}
-            filtered = [m_id for m_id in all_ids if m_id.lower() in allowed_set]
-            return filtered if filtered else allowed
+            return list(allowed)
         return all_ids
 
     async def effort_param_and_options(self, s: Session) -> tuple[str, list[str]] | None:
@@ -1236,6 +1244,19 @@ class SessionManager:
                 await self._recreate_agent(s)
                 return "recreated"
 
+    def wrap_outgoing_prompt(self, s: Session, prompt: str | UserMessage) -> str | UserMessage:
+        """Telegram delivery every turn; rules.md only when ``inject_rules_once``."""
+        wrapped = wrap_telegram_prompt(prompt)
+        if s.inject_rules_once:
+            wrapped = wrap_with_rules(wrapped, self.cfg.rules_text)
+            s.inject_rules_once = False
+            self._persist()
+        return wrapped
+
+    def arm_rules_inject(self, s: Session) -> None:
+        s.inject_rules_once = True
+        self._persist()
+
     async def run_prompt(
         self,
         s: Session,
@@ -1310,6 +1331,78 @@ class SessionManager:
                     except RuntimeError:
                         pass
 
+    async def _open_sdk_run(
+        self,
+        s: Session,
+        prompt: str | UserMessage,
+        send_opts: SendOptions,
+        *,
+        recreated: bool,
+    ) -> tuple[object, bool]:
+        """Ensure agent + send, with busy backoff / ISE recreate. Returns (run, recreated)."""
+        run = None
+        busy_backoffs_used = 0
+        busy_recreated = False
+        send_tries = 0
+        max_send_tries = BRIDGE_RUN_ATTEMPTS
+        while send_tries < max_send_tries:
+            send_tries += 1
+            try:
+                if await self._ensure_agent(s):
+                    recreated = True
+                run = await s.agent.send(prompt, send_opts)  # type: ignore[attr-defined]
+                break
+            except Exception as exc:  # noqa: BLE001
+                if _is_agent_busy(exc):
+                    if busy_backoffs_used < len(AGENT_BUSY_BACKOFFS_SEC):
+                        delay = AGENT_BUSY_BACKOFFS_SEC[busy_backoffs_used]
+                        busy_backoffs_used += 1
+                        logger.warning(
+                            "Agent busy for session %s (%s); waiting %.0fs "
+                            "before retry (backoff %s/%s)",
+                            s.short_id,
+                            exc,
+                            delay,
+                            busy_backoffs_used,
+                            len(AGENT_BUSY_BACKOFFS_SEC),
+                        )
+                        send_tries -= 1
+                        await asyncio.sleep(delay)
+                        continue
+                    if not busy_recreated:
+                        logger.warning(
+                            "Agent still busy for session %s after backoff; recreating",
+                            s.short_id,
+                        )
+                        async with self._agent_lock(s.short_id):
+                            await self._recreate_agent(s)
+                        recreated = True
+                        busy_recreated = True
+                        if max_send_tries == BRIDGE_RUN_ATTEMPTS:
+                            max_send_tries += 1
+                        continue
+                    raise
+                if send_tries >= max_send_tries:
+                    raise
+                if _is_bridge_down(exc):
+                    outcome = await self._recover_bridge_session(s, exc)
+                    if outcome == "recreated":
+                        recreated = True
+                    continue
+                if _is_stuck_agent(exc):
+                    logger.warning(
+                        "Stuck agent for session %s (%s); recreating and retrying",
+                        s.short_id,
+                        exc,
+                    )
+                    async with self._agent_lock(s.short_id):
+                        await self._recreate_agent(s)
+                    recreated = True
+                    continue
+                raise
+        assert run is not None
+        return run, recreated
+
     async def _run_prompt_inner(
         self,
         s: Session,
@@ -1321,6 +1414,7 @@ class SessionManager:
         _recreated: bool = False,
         _stall_retries: int = 0,
         _carry_text_parts: list[str] | None = None,
+        _empty_stage: int = 0,
     ) -> tuple[str, str, list[Path]]:
         # Backfill config default for sessions created before effort support,
         # or after /model cleared params without re-applying.
@@ -1330,51 +1424,9 @@ class SessionManager:
         ):
             await self.apply_default_effort(s)
         send_opts = SendOptions(model=self.model_for_sdk(s), mode=s.mode)  # type: ignore[arg-type]
-        run = None
-        recreated = _recreated
-        # Retry: busy -> same agent; dead bridge / ISE -> recover or recreate.
-        attempt = 1
-        busy_retries = 0
-        while attempt <= BRIDGE_RUN_ATTEMPTS:
-            try:
-                if await self._ensure_agent(s):
-                    recreated = True
-                run = await s.agent.send(prompt, send_opts)  # type: ignore[attr-defined]
-                break
-            except Exception as exc:  # noqa: BLE001
-                if _is_agent_busy(exc) and busy_retries < AGENT_BUSY_MAX_RETRIES:
-                    delay = AGENT_BUSY_BACKOFF_SEC[busy_retries]
-                    busy_retries += 1
-                    logger.warning(
-                        "Agent busy for session %s (%s); same-agent retry %s/%s in %.0fs",
-                        s.short_id,
-                        exc,
-                        busy_retries,
-                        AGENT_BUSY_MAX_RETRIES,
-                        delay,
-                    )
-                    await asyncio.sleep(delay)
-                    continue
-                if attempt >= BRIDGE_RUN_ATTEMPTS:
-                    raise
-                if _is_bridge_down(exc):
-                    outcome = await self._recover_bridge_session(s, exc)
-                    if outcome == "recreated":
-                        recreated = True
-                    attempt += 1
-                    continue
-                if _is_stuck_agent(exc):
-                    logger.warning(
-                        "Stuck agent for session %s (%s); recreating and retrying",
-                        s.short_id,
-                        exc,
-                    )
-                    async with self._agent_lock(s.short_id):
-                        await self._recreate_agent(s)
-                    recreated = True
-                    attempt += 1
-                    continue
-                raise
+        run, recreated = await self._open_sdk_run(
+            s, prompt, send_opts, recreated=_recreated,
+        )
         assert run is not None
         s.run = run
         s.run_id = getattr(run, "id", None)
@@ -1406,7 +1458,7 @@ class SessionManager:
         sent_paths: set[str] = set()
         running_tools: set[str] = set()
         live: dict[str, object] = {
-            "activity": "starting\u2026",
+            "activity": STARTING_ACTIVITY,
             "snippet": "",
             "elapsed": None,
         }
@@ -1512,6 +1564,7 @@ class SessionManager:
         hb_task = asyncio.create_task(_heartbeat())
         stall_task = asyncio.create_task(_stall_watchdog())
         blocked_tool_msg: str | None = None
+        sdk_status_error_msg: str | None = None
         permission = (
             (self.bot_cfg.permission if self.bot_cfg else None) or "full"
         )
@@ -1643,10 +1696,14 @@ class SessionManager:
                                     _build_live(s, text_parts, live), force=True,
                                 )
                     elif mtype == "status":
-                        activity = format_sdk_status_activity(
-                            str(getattr(message, "status", "") or ""),
-                            str(getattr(message, "message", "") or ""),
-                        )
+                        s_status = str(getattr(message, "status", "") or "")
+                        s_msg = str(getattr(message, "message", "") or "")
+                        if (
+                            _normalize_sdk_status(s_status) == "error"
+                            or "error" in s_status.lower()
+                        ) and s_msg:
+                            sdk_status_error_msg = s_msg
+                        activity = format_sdk_status_activity(s_status, s_msg)
                         if activity:
                             _mark_progress()
                             live["snippet"] = ""
@@ -1761,6 +1818,7 @@ class SessionManager:
                 _depth=_depth + 1,
                 _recreated=pending_recreated,
                 _stall_retries=_stall_retries,
+                _empty_stage=_empty_stage,
             )
 
         try:
@@ -1808,6 +1866,7 @@ class SessionManager:
                     _depth=_depth + 1,
                     _recreated=(outcome == "recreated"),
                     _stall_retries=_stall_retries,
+                    _empty_stage=_empty_stage,
                 )
             s.status = STATUS_ERROR
             s.run = None
@@ -1876,6 +1935,7 @@ class SessionManager:
                     _recreated=recreated,
                     _stall_retries=_stall_retries + 1,
                     _carry_text_parts=text_parts,
+                    _empty_stage=_empty_stage,
                 )
             abort_msg = (
                 f"**Run aborted:** no agent progress for {int(stalled_limit)}s "
@@ -1892,6 +1952,12 @@ class SessionManager:
                 tool_hits=tool_hits,
             )
         if rstatus == "error":
+            if sdk_status_error_msg:
+                err_line = f"**Cursor Error:** {sdk_status_error_msg}"
+                if not (final or "").strip():
+                    final = err_line
+                elif err_line not in final:
+                    final = f"{final}\n\n{err_line}"
             logger.warning(
                 "Session %s run error: duration_ms=%s output=%r",
                 s.short_id,
@@ -1899,81 +1965,112 @@ class SessionManager:
                 (final or "")[:300],
             )
 
-        instant_empty_error = _is_instant_empty_error(
+        instant_empty_error = is_instant_empty_error(
             stalled=stalled,
             rstatus=rstatus,
-            final=final or "",
             text_parts=text_parts,
             tool_hits=tool_hits,
             elapsed_sec=time.time() - run_started_at,
+            final=final if isinstance(final, str) else "",
         )
         if instant_empty_error:
-            same_agent = _depth == 0
-            logger.warning(
-                "Session %s instant empty error (model=%s mode=%s) — %s",
-                s.short_id,
-                s.model,
-                s.mode,
-                "same-agent retry" if same_agent else "recreating and auto-retrying",
-            )
-            activity = (
-                "\u26a0\ufe0f instant empty error — retrying same agent\u2026"
-                if same_agent
-                else (
-                    "\u26a0\ufe0f instant empty error — recreating agent and retrying\u2026"
-                )
-            )
-            try:
-                await on_update(
-                    _build_live(
-                        s,
-                        text_parts,
-                        {
-                            "activity": activity,
-                            "snippet": "",
-                            "elapsed": live.get("elapsed"),
-                        },
-                    ),
-                    force=True,
-                )
-            except Exception:  # noqa: BLE001
+            if _empty_stage <= 0:
                 logger.warning(
-                    "instant-empty notify failed for %s", s.short_id, exc_info=True,
+                    "Session %s instant empty error (model=%s mode=%s) — "
+                    "retrying same agent",
+                    s.short_id,
+                    s.model,
+                    s.mode,
                 )
-            if same_agent:
+                try:
+                    await on_update(
+                        _build_live(
+                            s,
+                            text_parts,
+                            {
+                                "activity": (
+                                    "\u26a0\ufe0f instant empty error — "
+                                    "retrying same agent\u2026"
+                                ),
+                                "snippet": "",
+                                "elapsed": live.get("elapsed"),
+                            },
+                        ),
+                        force=True,
+                    )
+                except Exception:  # noqa: BLE001
+                    logger.warning(
+                        "instant-empty notify failed for %s", s.short_id, exc_info=True,
+                    )
+                s.run = None
+                s.run_id = None
+                s.status = STATUS_RUNNING
+                self._persist()
                 return await self._run_prompt_inner(
                     s,
                     prompt,
                     on_update,
                     on_attachment,
-                    _depth=1,
+                    _depth=_depth,
+                    _recreated=recreated,
                     _stall_retries=_stall_retries,
+                    _empty_stage=1,
                 )
-            try:
-                async with self._agent_lock(s.short_id):
-                    await self._recreate_agent(s)
-            except Exception:
+            if _empty_stage == 1:
                 logger.warning(
-                    "Recreate after instant error failed for %s",
+                    "Session %s instant empty error (model=%s mode=%s) — "
+                    "recreating and auto-retrying",
                     s.short_id,
-                    exc_info=True,
+                    s.model,
+                    s.mode,
                 )
-                final = (
-                    f"{instant_empty_user_message(s.model, s.mode)}\n\n"
-                    "Could not reset the session — try /end and /new."
-                )
-                rstatus = STATUS_GLITCH
-                s.status = STATUS_IDLE
-            else:
-                if _depth == 1:
+                try:
+                    await on_update(
+                        _build_live(
+                            s,
+                            text_parts,
+                            {
+                                "activity": (
+                                    "\u26a0\ufe0f instant empty error — "
+                                    "recreating agent and retrying\u2026"
+                                ),
+                                "snippet": "",
+                                "elapsed": live.get("elapsed"),
+                            },
+                        ),
+                        force=True,
+                    )
+                except Exception:  # noqa: BLE001
+                    logger.warning(
+                        "instant-empty notify failed for %s", s.short_id, exc_info=True,
+                    )
+                try:
+                    async with self._agent_lock(s.short_id):
+                        await self._recreate_agent(s)
+                except Exception:
+                    logger.warning(
+                        "Recreate after instant error failed for %s",
+                        s.short_id,
+                        exc_info=True,
+                    )
+                    final = (
+                        f"{instant_empty_user_message(s.model, s.mode)}\n\n"
+                        "Could not reset the session — try /end and /new."
+                    )
+                    rstatus = STATUS_GLITCH
+                    s.status = STATUS_IDLE
+                else:
                     return await self._run_prompt_inner(
                         s,
                         prompt,
                         on_update,
                         on_attachment,
-                        _depth=2,
+                        _depth=_depth,
+                        _recreated=True,
                         _stall_retries=_stall_retries,
+                        _empty_stage=2,
                     )
+            else:
                 final = instant_empty_user_message(s.model, s.mode)
                 rstatus = STATUS_GLITCH
                 s.status = STATUS_IDLE
@@ -2089,5 +2186,6 @@ class SessionManager:
                 context_lost_notice_pending=bool(
                     sd.get("context_lost_notice_pending")
                 ),
+                inject_rules_once=bool(sd.get("inject_rules_once", False)),
             )
             self.sessions[s.short_id] = s

@@ -50,10 +50,10 @@ def _tail(path: Path, n: int) -> list[str]:
 
 def _badge(status: str) -> str:
     if status == "running":
-        return "\U0001F7E2"
+        return "\u26a1"
     if status == "error":
-        return "\U0001F534"
-    return "\U0001F7E1"
+        return "\u26a0\ufe0f"
+    return "\U0001F4A4"
 
 
 def _render(cfg, *, log_path: Path) -> str:

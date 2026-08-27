@@ -64,14 +64,15 @@ from .config import BotConfig, Config, load_config
 from .context import format_context_html, format_context_line, fmt_tokens
 from .folders import TokenStore, browser_keyboard, projects_keyboard
 from .formatting import (
+    THINKING_ACTIVITY,
     build_final_html,
     build_live_html,
     chunk_telegram_html,
     html_to_plain_preview,
     looks_like_plan_document,
 )
-from .rules import strip_rules_prefix, wrap_with_rules
-from .telegram_delivery import strip_telegram_delivery_prefix, wrap_telegram_prompt
+from .rules import strip_rules_prefix
+from .telegram_delivery import strip_telegram_delivery_prefix
 from .inbound import (
     INBOUND_BATCH_DELAY_SEC,
     InboundBatcher,
@@ -462,10 +463,10 @@ def esc(text: object) -> str:
 
 def _badge(status: str) -> str:
     if status == STATUS_RUNNING:
-        return "\U0001F7E2"  # green
+        return "\u26a1"  # ⚡
     if status == STATUS_ERROR:
-        return "\U0001F534"  # red
-    return "\U0001F7E1"  # yellow (idle)
+        return "\u26a0\ufe0f"  # ⚠️
+    return "\U0001F4A4"  # 💤 idle
 
 
 def _chunks(text: str, size: int = TG_LIMIT) -> list[str]:
@@ -1306,7 +1307,7 @@ async def _start_user_prompt(
     s: Session,
     prompt: str | UserMessage,
     *,
-    thinking_label: str = "\U0001F4AD thinking\u2026",
+    thinking_label: str = THINKING_ACTIVITY,
     log_kind: str = "Prompt",
 ) -> None:
     """Start a prompt, or apply busy_policy (queue / interrupt) when one is running."""
@@ -1460,8 +1461,10 @@ async def _run_compact(
         return
 
     status_icon = "\u2705 compacted" if rstatus == "finished" else (
-        "\u270B cancelled" if rstatus == "cancelled" else f"\U0001F534 {esc(rstatus)}"
+        "\u270B cancelled" if rstatus == "cancelled" else f"\u26a0\ufe0f {esc(rstatus)}"
     )
+    if rstatus == "finished":
+        mgr.arm_rules_inject(s)
     ctx = format_context_line(mgr.session_context(s))
     body = (final or "(done)").strip()
     final_html = build_final_html(
@@ -1576,7 +1579,7 @@ async def _run_context(
         return
 
     status_icon = "\u2705 context restored" if rstatus == "finished" else (
-        "\u270B cancelled" if rstatus == "cancelled" else f"\U0001F534 {esc(rstatus)}"
+        "\u270B cancelled" if rstatus == "cancelled" else f"\u26a0\ufe0f {esc(rstatus)}"
     )
     if rstatus == "finished":
         s.context_restored_from = restored_from
@@ -2015,7 +2018,7 @@ async def _execute_prompt(
     s: Session,
     prompt: str | UserMessage,
     *,
-    thinking_label: str = "\U0001F4AD thinking\u2026",
+    thinking_label: str = THINKING_ACTIVITY,
     log_kind: str = "Prompt",
 ) -> None:
     mgr = _mgr(context)
@@ -2065,7 +2068,7 @@ async def _execute_prompt(
     try:
         rstatus, final, attachments = await mgr.run_prompt(
             s,
-            wrap_with_rules(wrap_telegram_prompt(prompt), mgr.cfg.rules_text),
+            mgr.wrap_outgoing_prompt(s, prompt),
             on_update,
             on_attachment=on_attachment,
         )
@@ -2095,7 +2098,7 @@ async def _execute_prompt(
         "\u2705" if rstatus == "finished"
         else "\u26a0\ufe0f model failed" if rstatus == STATUS_GLITCH
         else "\u270B cancelled" if rstatus == "cancelled"
-        else f"\U0001F534 {esc(rstatus)}"
+        else f"\u26a0\ufe0f {esc(rstatus)}"
     )
     _log_action("Prompt done", session=s.short_id, status=rstatus, attachments=len(attachments))
     final_html = build_final_html(
@@ -2618,8 +2621,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             _log_action("Restart requested (menu)", user=update.effective_user.id, bot=bot_name)
             await context.bot.send_message(
                 chat_id,
-                "♻️ <b>正在重启 Bot 服务…</b>\n\n"
-                "重新加载配置与会话状态，恢复在线时会自动通知您。",
+                "♻️ <b>正在重启 Bot 服务…</b>",
                 parse_mode=ParseMode.HTML,
             )
         elif action == "reload":
@@ -2631,8 +2633,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             _log_action("Reload requested (menu)", user=update.effective_user.id, bot=bot_name)
             await context.bot.send_message(
                 chat_id,
-                "⚛️ <b>正在重载守护进程…</b>\n\n"
-                "重新加载 Python 源代码与环境，恢复在线时会自动通知您。",
+                "⚛️ <b>正在重载守护进程…</b>",
                 parse_mode=ParseMode.HTML,
             )
             asyncio.create_task(_kickstart_after_reply(cfg))
@@ -2689,13 +2690,11 @@ async def _send_restart_notify(app: Application) -> None:
 
     if mode == "reload":
         msg = (
-            "✅ <b>守护进程重载成功</b>\n\n"
-            "最新 Python 源码与系统环境已恢复上线。"
+            "✅ <b>守护进程重载成功</b>"
         )
     else:
         msg = (
-            "✅ <b>Bot 服务重启成功</b>\n\n"
-            "最新配置与会话状态已加载完成。"
+            "✅ <b>Bot 服务重启成功</b>"
         )
 
     for attempt in range(1, 4):
@@ -2769,8 +2768,7 @@ async def cmd_reload(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     _request_restart(cfg, update.effective_chat.id, mode="reload", bot=bot_name)
     _log_action("Reload requested (launchd kickstart)", user=update.effective_user.id, bot=bot_name)
     await update.message.reply_text(
-        "⚛️ <b>正在重载守护进程…</b>\n\n"
-        "重新加载 Python 源代码与环境，恢复在线时会自动通知您。",
+        "⚛️ <b>正在重载守护进程…</b>",
         parse_mode=ParseMode.HTML,
     )
     asyncio.create_task(_kickstart_after_reply(cfg))
@@ -2784,8 +2782,7 @@ async def cmd_restart(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     _request_restart(cfg, update.effective_chat.id, mode="restart", bot=bot_name)
     _log_action("Restart requested", user=update.effective_user.id, bot=bot_name)
     await update.message.reply_text(
-        "♻️ <b>正在重启 Bot 服务…</b>\n\n"
-        "重新加载配置与会话状态，恢复在线时会自动通知您。",
+        "♻️ <b>正在重启 Bot 服务…</b>",
         parse_mode=ParseMode.HTML,
     )
 

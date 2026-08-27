@@ -6,12 +6,8 @@ from cursor_sdk import UserMessage
 
 TELEGRAM_DELIVERY_PREFIX = (
     "[cursor-telegram-bridge · Telegram] "
-    "用户在 Telegram 聊天中阅读回复 — 没有桌面端 Plan 面板。"
-    "请将完整的计划、方案或回答直接呈现在回复中，不要停留在“我将为您起草”等预告性语句。"
-    "Plan 模式下 createPlan 全文由 bridge 自动投递到聊天；"
-    "你在回复里给短结论即可，勿再贴 createPlan 全文以免重复。"
-    "禁止主动阅读 ~/.cursor/**/agent-transcripts/ 或其他会话的 "
-    ".cursor_bridge/prior-context-*.md；需要历史时等用户 /context。"
+    "回复发到 Telegram（无桌面 Plan 面板）。完整答案写进这条回复，不要只预告。"
+    "Plan：createPlan 由 bridge 转发，你只给短结论，勿再贴全文。"
     "\n\n"
 )
 
