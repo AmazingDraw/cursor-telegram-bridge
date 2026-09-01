@@ -764,7 +764,7 @@ def _format_table_card(header: list[str], rows: list[list[str]]) -> str:
         cell = cell.strip()
         if not cell:
             return "—"
-        cell_html = html.escape(cell)
+        cell_html = html.escape(html.unescape(cell))
         cell_html = re.sub(
             r"\[([^\]\n]+)\]\((https?://[^\s\)]+)\)",
             r'<a href="\2">\1</a>',
@@ -956,6 +956,7 @@ def markdown_to_telegram_html(text: str, *, max_code_lines: int | None = None) -
     text = re.sub(r"`([^`]+)`", _save_inline_code, text)
     text = re.sub(r"\[([^\]]+)\]\((https?://[^)]+)\)", _save_link, text)
 
+    text = html.unescape(text)
     text = html.escape(text)
     text = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", text)
     text = re.sub(r"(?<!\*)\*([^*\n]+?)\*(?!\*)", r"<i>\1</i>", text)

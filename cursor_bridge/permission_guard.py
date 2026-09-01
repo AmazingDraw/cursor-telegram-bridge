@@ -6,12 +6,7 @@ import os
 import re
 from pathlib import Path
 
-from .formatting import _normalize_tool, parse_tool_args
-from .shell_guard import (
-    blocked_shell_message,
-    is_blocked_self_management,
-    shell_command_from_args,
-)
+from .formatting import _arg_text, _normalize_tool, parse_tool_args
 
 # Normalized tool names allowed when permission == "readonly".
 # Images arrive via Telegram inbound (bridge), not GenerateImage.
@@ -40,6 +35,12 @@ _PATH_KEYS = (
 
 _AGENT_TRANSCRIPTS_MARKER = "agent-transcripts"
 _PRIOR_CONTEXT_RE = re.compile(r"prior-context-([A-Za-z0-9_-]+)", re.IGNORECASE)
+
+
+def shell_command_from_args(name: str, args: object) -> str:
+    if _normalize_tool(name) not in ("shell", "runterminalcmd", "terminal"):
+        return ""
+    return _arg_text(parse_tool_args(args), "command", "cmd")
 
 
 def tool_paths_from_args(name: str, args: object) -> list[str]:
@@ -157,14 +158,11 @@ def evaluate_tool_call(
 ) -> str | None:
     """Return a block message, or ``None`` if the tool call is allowed.
 
-    Always blocks self-management shells and cross-session transcript reads.
+    Always blocks cross-session transcript reads.
     When ``permission == \"readonly\"``, only the read/search allowlist is
     permitted, and every path arg must stay inside ``cwd``.
     """
     cmd = shell_command_from_args(name, args)
-    if is_blocked_self_management(cmd):
-        return blocked_shell_message(cmd)
-
     deny = _isolation_deny(name, args, session_id=session_id, cmd=cmd)
     if deny:
         return deny

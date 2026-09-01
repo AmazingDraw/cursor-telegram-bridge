@@ -1,4 +1,4 @@
-"""Bridge-owned global rules injection for every prompt."""
+"""Bridge-owned global rules injection at session edges."""
 
 from __future__ import annotations
 

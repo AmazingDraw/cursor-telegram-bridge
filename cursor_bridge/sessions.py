@@ -309,6 +309,12 @@ def is_instant_empty_error(
     )
 
 
+def is_stale_cursor_auth_error(message: str | None) -> bool:
+    """True for idle Cursor JWT/session expiry the SDK reports as Authentication error."""
+    text = (message or "").lower()
+    return "authentication error" in text
+
+
 class SessionManager:
     """Owns the Cursor SDK bridge plus the registry of live agent sessions."""
 
@@ -1415,6 +1421,7 @@ class SessionManager:
         _stall_retries: int = 0,
         _carry_text_parts: list[str] | None = None,
         _empty_stage: int = 0,
+        _auth_retries: int = 0,
     ) -> tuple[str, str, list[Path]]:
         # Backfill config default for sessions created before effort support,
         # or after /model cleared params without re-applying.
@@ -1819,6 +1826,7 @@ class SessionManager:
                 _recreated=pending_recreated,
                 _stall_retries=_stall_retries,
                 _empty_stage=_empty_stage,
+                _auth_retries=_auth_retries,
             )
 
         try:
@@ -1867,6 +1875,7 @@ class SessionManager:
                     _recreated=(outcome == "recreated"),
                     _stall_retries=_stall_retries,
                     _empty_stage=_empty_stage,
+                    _auth_retries=_auth_retries,
                 )
             s.status = STATUS_ERROR
             s.run = None
@@ -1936,6 +1945,7 @@ class SessionManager:
                     _stall_retries=_stall_retries + 1,
                     _carry_text_parts=text_parts,
                     _empty_stage=_empty_stage,
+                    _auth_retries=_auth_retries,
                 )
             abort_msg = (
                 f"**Run aborted:** no agent progress for {int(stalled_limit)}s "
@@ -1964,6 +1974,63 @@ class SessionManager:
                 getattr(result, "duration_ms", None),
                 (final or "")[:300],
             )
+            auth_hint = sdk_status_error_msg or (final if isinstance(final, str) else "")
+            if (
+                is_stale_cursor_auth_error(auth_hint)
+                and _auth_retries < 1
+                and not stalled
+                and blocked_tool_msg is None
+            ):
+                logger.warning(
+                    "Session %s stale Cursor auth — rebuilding SDK bridge and retrying",
+                    s.short_id,
+                )
+                try:
+                    await on_update(
+                        _build_live(
+                            s,
+                            text_parts,
+                            {
+                                "activity": (
+                                    "\u26a0\ufe0f auth expired — reconnecting\u2026"
+                                ),
+                                "snippet": "",
+                                "elapsed": live.get("elapsed"),
+                            },
+                        ),
+                        force=True,
+                    )
+                except Exception:  # noqa: BLE001
+                    logger.warning(
+                        "stale-auth notify failed for %s", s.short_id, exc_info=True,
+                    )
+                s.run = None
+                s.run_id = None
+                s.status = STATUS_RUNNING
+                self._persist()
+                try:
+                    outcome = await self._recover_bridge_session(
+                        s,
+                        RuntimeError(auth_hint or "authentication error"),
+                    )
+                except Exception:
+                    logger.warning(
+                        "Stale-auth recovery failed for %s",
+                        s.short_id,
+                        exc_info=True,
+                    )
+                else:
+                    return await self._run_prompt_inner(
+                        s,
+                        prompt,
+                        on_update,
+                        on_attachment,
+                        _depth=_depth,
+                        _recreated=(outcome == "recreated"),
+                        _stall_retries=_stall_retries,
+                        _empty_stage=_empty_stage,
+                        _auth_retries=1,
+                    )
 
         instant_empty_error = is_instant_empty_error(
             stalled=stalled,
@@ -2015,6 +2082,7 @@ class SessionManager:
                     _recreated=recreated,
                     _stall_retries=_stall_retries,
                     _empty_stage=1,
+                    _auth_retries=_auth_retries,
                 )
             if _empty_stage == 1:
                 logger.warning(
@@ -2069,6 +2137,7 @@ class SessionManager:
                         _recreated=True,
                         _stall_retries=_stall_retries,
                         _empty_stage=2,
+                        _auth_retries=_auth_retries,
                     )
             else:
                 final = instant_empty_user_message(s.model, s.mode)

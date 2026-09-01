@@ -1,4 +1,4 @@
-# Bridge global rules (injected into every Telegram prompt).
+# Bridge global rules (injected on /new, resume, recreate, and after /compact).
 #
 # Cursor Customize → User Rules are NOT visible to the SDK.
 # Copy this file to rules.md, paste your User Rule text, then /reload.

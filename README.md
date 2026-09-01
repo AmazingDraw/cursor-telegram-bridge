@@ -43,6 +43,7 @@ launchctl load ~/Library/LaunchAgents/com.cursor-telegram-bridge.bot.plist
 | --- | --- |
 | `/new` `/browse` `/cd` | 开会话 / 选目录 |
 | `/sessions` `/use` `/status` `/end` | 列会话 / 切换 / 状态 / 关闭 |
+| `/rename` | 当前会话自定义名称 |
 | `/model` `/effort` `/mode` | 模型、思考等级、agent/plan |
 | `/busy` | 忙碌时：`queue`（默认，可排队）或 `interrupt` |
 | `/cancel` `/compact` `/context` | 取消任务 / 压缩上下文 / 恢复上下文 |
@@ -54,19 +55,11 @@ launchctl load ~/Library/LaunchAgents/com.cursor-telegram-bridge.bot.plist
 
 Live 回复在同一条消息里原地更新（工具活动 + 最终 HTML）。本地 Web 面板：`http://127.0.0.1:9477`（可设 `CONSOLE_TOKEN`）。
 
-## 配置
-
-**`.env`（勿提交）**：`TELEGRAM_BOT_TOKEN_1`、`CURSOR_API_KEY`、`ALLOWED_TELEGRAM_USER_ID`；可选 `TELEGRAM_BOT_TOKEN_2`、`CONSOLE_TOKEN`。
-
-**`config.toml`**：`projects_root`、`model` / `models`、`effort`、`busy_policy`、`rules_file`、`[model_context_windows]`（仅 Bridge UI 上下文估算分母，不改 Cursor 真实截断）、`[[bookmarks]]`、`[[bots]]`（多 bot、`permission`、`allowed_chat_ids`）等。细节见文件内注释。
-
-多 bot 时各 bot 会话目录独立（`state/bots/<name>/`），共用 API Key 与 `rules.md`。`permission = "readonly"` 只允许读类工具且路径不离会话目录。
-
 ## 安全
 
 - 默认单用户；群聊需显式 `allowed_chat_ids`。
 - `full` 权限等同在该文件夹远程执行工具，请只绑自己的账号。
-- `/files` 不会发出 `.env`、`.git`、依赖目录等；停服务请用 `/reload` / `/restart`，勿让 Agent 杀进程。
+- `/files` 不会发出 `.env`、`.git`、依赖目录等。Agent 也可以用 `launchctl` 重启本服务；Telegram `/reload` / `/restart` 仍可用。
 
 ## 排障
 

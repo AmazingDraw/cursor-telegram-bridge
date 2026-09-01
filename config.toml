@@ -66,7 +66,7 @@ health_kickstart_after_soft = 2
 # Use rules_file / rules below to inject those into Telegram prompts.
 setting_sources = ["user", "project"]
 
-# Bridge-owned rules injected into every prompt (new + resume).
+# Bridge-owned rules injected on /new, resume, recreate, and after /compact.
 # Paste your Cursor User Rule text into rules.md (or set an absolute path).
 rules_file = "rules.md"
 # Optional inline alternative (or addition) to rules_file:
@@ -105,7 +105,7 @@ opus = 1000000
 #
 # Per-bot permission & group access (optional):
 #   permission = "full" | "readonly"
-#     full     — default; same as today (self-management shell still blocked)
+#     full     — default; Shell/Write/Edit allowed (including bot restart)
 #     readonly — hard-deny Shell/Write/Edit/Delete/GenerateImage/MCP; Read/Grep/Glob
 #                only; every path arg must stay inside the session cwd
 #   allowed_chat_ids = [-100xxxxxxxxxx]
