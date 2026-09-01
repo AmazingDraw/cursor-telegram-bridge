@@ -112,17 +112,17 @@ HELP = (
     "<b>项目与会话管理</b>\n"
     "/new [路径] — 启动新会话（留空打开目录选择器）\n"
     "/browse [路径] — 逐级浏览选择项目目录\n"
-    "/cd &lt;路径&gt; — 在指定绝对路径启动新会话\n"
+    f"/cd {html.escape('<路径>')} — 在指定绝对路径启动新会话\n"
     "/sessions — 查看会话列表、切换/取消/结束会话\n"
-    "/use &lt;id&gt; — 切换当前激活的会话\n"
+    f"/use {html.escape('<id>')} — 切换当前激活的会话\n"
     "/status — 查看当前激活会话、运行状态与上下文\n"
-    "/rename &lt;名称&gt; — 修改当前激活会话的自定义名称\n"
+    f"/rename {html.escape('<名称>')} — 修改当前激活会话的自定义名称\n"
     "/model — 切换当前会话的模型\n"
     "/effort — 设置思考等级 (支持 Reasoning 的模型)\n"
     "/mode [agent|plan] — 查看或切换 agent/plan 模式\n"
     "/busy [interrupt|queue] — 忙碌时新消息：排队/发送/取消(默认) 或 打断\n"
     "/cancel — 取消当前正在运行的任务\n"
-    "/end &lt;id&gt; — 关闭并释放指定会话\n"
+    f"/end {html.escape('<id>')} — 关闭并释放指定会话\n"
     "/usage — 查看订阅与额度使用情况\n"
     "/restart — 软重启（重新加载 .env/config）\n"
     "/reload — 重新加载后台守护进程（更新代码）\n\n"
@@ -934,7 +934,9 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not await _guard(update, context):
         return
     _log_action("Command /start", user=update.effective_user.id)
-    await update.message.reply_text(HELP, reply_markup=_menu_kb())
+    await update.message.reply_text(
+        HELP, parse_mode=ParseMode.HTML, reply_markup=_menu_kb(),
+    )
 
 
 async def cmd_new(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
